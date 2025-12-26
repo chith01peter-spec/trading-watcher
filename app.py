@@ -7,12 +7,27 @@ import yfinance as yf
 import numpy as np
 from datetime import datetime, timedelta
 import os
-import logic  # logic.pyを読み込み
+import requests  # ← これが必要です
+import logic
 
 # --- 設定 ---
 CSV_FILE = "signals_history.csv"
 
-# --- 履歴管理 ---
+# --- Discord設定の読み込み (復活) ---
+try:
+    DISCORD_WEBHOOK_URL = st.secrets["DISCORD_URL"]
+except:
+    DISCORD_WEBHOOK_URL = ""
+
+def send_discord_notify(msg):
+    """Discordにメッセージを送信する"""
+    if not DISCORD_WEBHOOK_URL: return
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+    except:
+        pass
+
+# --- 履歴管理 & 通知 ---
 def update_signal_history(current_results):
     if os.path.exists(CSV_FILE):
         try:
@@ -25,21 +40,31 @@ def update_signal_history(current_results):
     if current_results:
         new_items = []
         now = datetime.now()
+        
+        # 新着チェック
         for item in current_results:
             is_duplicate = False
+            
+            # 1. 履歴CSV内の重複チェック (60分以内)
             if not df_history.empty:
                 recent = df_history[df_history['time'] >= (now - timedelta(minutes=60))]
                 matches = recent[(recent['code'].astype(str) == str(item['code'])) & (recent['sig'] == item['sig'])]
                 if not matches.empty: is_duplicate = True
             
+            # 2. まだ通知していない場合のみ処理
             if not is_duplicate:
                 new_items.append(item)
-                st.toast(f"🔔 {item['name']} : {item['sig']}", icon="🦅")
+                
+                # ▼▼ ここで通知 (復活！) ▼▼
+                msg = f"🦅 **{item['name']} ({item['code']})**\nシグナル: {item['sig']}\n価格: {item['price']:,.0f}円\nRSI: {item['rsi']:.1f}"
+                send_discord_notify(msg)       # Discordへ
+                st.toast(f"🔔 {item['name']}", icon="🦅") # 画面へ
 
+        # 新しいデータがあれば保存
         if new_items:
             df_new = pd.DataFrame(new_items)
             df_history = pd.concat([df_history, df_new], ignore_index=True)
-            df_history = df_history[df_history['time'] >= (now - timedelta(days=7))] # 1週間保存
+            df_history = df_history[df_history['time'] >= (now - timedelta(days=7))]
             df_history = df_history.sort_values('time', ascending=False)
             df_history.to_csv(CSV_FILE, index=False)
 
@@ -82,8 +107,8 @@ def display_signal_area(df_signals):
 # ==========================================
 # メイン処理
 # ==========================================
-st.set_page_config(page_title="Trading Watcher V26.5", layout="wide", page_icon="🦅")
-st_autorefresh(interval=60*1000, key="auto_update") # 60秒更新
+st.set_page_config(page_title="Trading Watcher V26.6", layout="wide", page_icon="🦅")
+st_autorefresh(interval=60*1000, key="auto_update")
 
 if 'notified_ids' not in st.session_state: st.session_state.notified_ids = set()
 
@@ -94,7 +119,12 @@ with st.spinner('🦅 全銘柄分析中...'):
     df_history = update_signal_history(current_results)
 
 # --- サイドバー ---
-st.sidebar.title("🦅 Watcher V26.5")
+st.sidebar.title("🦅 Watcher V26.6")
+# 通知テストボタン
+if st.sidebar.button("🔔 通知テスト"):
+    send_discord_notify("🔔 [TEST] 通信テストOKです！")
+    st.sidebar.success("送信しました")
+
 mode = st.sidebar.radio("モード", ["🦅 コックピット", "🔍 詳細分析"])
 
 with st.sidebar.expander("🛡 ロット計算"):
@@ -112,25 +142,19 @@ if mode == "🦅 コックピット":
 
 else: # 詳細分析モード
     st.markdown("### 📊 Market Indices")
-    # --- デフォルト表示：指数パネル ---
-    # Nikkei, Nikkei Fut(NIY=F), TOPIX, TOPIX Fut(proxy or index)
     indices = {"日経平均": "^N225", "日経先物(CME)": "NIY=F", "TOPIX": "^TOPX", "USD/JPY": "JPY=X"}
-    
     idx_cols = st.columns(len(indices))
     for i, (label, ticker) in enumerate(indices.items()):
         with idx_cols[i]:
             try:
-                # 簡易取得
                 d = yf.Ticker(ticker).history(period="2d")
                 if not d.empty:
                     last = d.iloc[-1]['Close']
                     prev = d.iloc[-2]['Close']
                     delta = last - prev
                     st.metric(label, f"{last:,.2f}", f"{delta:+.2f}")
-                else:
-                    st.metric(label, "取得失敗", "-")
-            except:
-                st.metric(label, "Error", "-")
+                else: st.metric(label, "取得失敗", "-")
+            except: st.metric(label, "Error", "-")
     
     st.divider()
 
@@ -156,7 +180,6 @@ else: # 詳細分析モード
                     
                     df = logic.calculate_technical_indicators(df)
                     
-                    # チャート
                     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7,0.3])
                     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
                     
@@ -175,7 +198,6 @@ else: # 詳細分析モード
                     fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False)
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    # バックテスト
                     trades, dd = logic.run_backtest(df, tp, ["買い","売り"], sh)
                     if trades:
                         pl = sum([t['profit'] for t in trades])
