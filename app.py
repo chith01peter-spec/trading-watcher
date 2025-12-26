@@ -33,7 +33,7 @@ def run_streamlit():
 run_streamlit()
 
 # ==========================================
-# V23.1 Trading Watcher (Full Spec: Buy & Sell Restored)
+# V23.2 Trading Watcher (Clear Timestamp UI)
 # ==========================================
 import streamlit as st
 import pandas as pd
@@ -44,7 +44,7 @@ from streamlit_autorefresh import st_autorefresh
 import numpy as np
 import requests
 
-st.set_page_config(page_title="Trading Watcher V23.1", layout="wide")
+st.set_page_config(page_title="Trading Watcher V23.2", layout="wide")
 
 # ==========================================
 # ★設定エリア
@@ -144,7 +144,6 @@ def process_data(df, interval):
         supertrend[i] = final_lower[i] if trend_dir[i] else final_upper[i]
     df['SuperTrend'] = supertrend; df['SuperTrend_Dir'] = trend_dir
 
-    # ★ 3層シグナル判定 (売り復活)
     signals = []
     is_daily = "d" in interval; is_5m = "5m" in interval
     for i in range(len(df)):
@@ -156,45 +155,35 @@ def process_data(df, interval):
         d_cross = prev['MACD'] > prev['Signal'] and row['MACD'] < row['Signal']
         
         if is_daily:
-            # 🐢 SWING
             if is_uptrend and g_cross: sig = 'SWING_BUY'
-            elif is_downtrend and d_cross: sig = 'SWING_SELL' # 復活
+            elif is_downtrend and d_cross: sig = 'SWING_SELL'
             elif row['RSI'] < 30 and row['Close'] > prev['Close']: sig = 'SWING_BUY (RSI)'
-            elif row['RSI'] > 70 and row['Close'] < prev['Close']: sig = 'SWING_SELL (RSI)' # 復活
+            elif row['RSI'] > 70 and row['Close'] < prev['Close']: sig = 'SWING_SELL (RSI)'
             elif row['SuperTrend_Dir'] == True and prev['SuperTrend_Dir'] == False: sig = 'SWING_BUY (Trend)'
-            elif row['SuperTrend_Dir'] == False and prev['SuperTrend_Dir'] == True: sig = 'SWING_SELL (Trend)' # 復活
-        
+            elif row['SuperTrend_Dir'] == False and prev['SuperTrend_Dir'] == True: sig = 'SWING_SELL (Trend)'
         elif is_5m:
-            # 🛡️ DAY-STD
             if is_uptrend and g_cross: sig = 'DAY_BUY'
-            elif is_downtrend and d_cross: sig = 'DAY_SELL' # 復活
-            
+            elif is_downtrend and d_cross: sig = 'DAY_SELL'
         else:
-            # ⚡ DAY-FAST
             if pd.isna(row['ADX']) or pd.isna(row['VWAP']): signals.append(None); continue
             adx_ok = row['ADX'] > 25
             buy_vwap_ok = row['Close'] > row['VWAP']; sell_vwap_ok = row['Close'] < row['VWAP']
             if is_uptrend and g_cross and adx_ok and buy_vwap_ok: sig = 'SCALP_BUY'
-            elif is_downtrend and d_cross and adx_ok and sell_vwap_ok: sig = 'SCALP_SELL' # 復活
-            
+            elif is_downtrend and d_cross and adx_ok and sell_vwap_ok: sig = 'SCALP_SELL'
         signals.append(sig)
-    
     df['Trade_Signal'] = signals
     return df
 
-# --- バックテスト (売買両対応) ---
+# --- バックテスト ---
 def run_backtest(df, tp_pct, trade_dir, shares):
     trades = []; active_trade = None 
     do_long = "買い" in trade_dir; do_short = "売り" in trade_dir
     max_dd = 0; peak_equity = 0; equity = 0
-
     for i in range(len(df)):
         row = df.iloc[i]; sig = row['Trade_Signal']; st_val = row['SuperTrend']
         trade_closed = False; profit = 0
-
         if active_trade:
             entry_price = active_trade['entry_price']; entry_tp = active_trade['target_tp']
-            # 利確/損切り判定
             if active_trade['type'] == 'buy':
                 if row['High'] >= entry_tp:
                     profit = (entry_tp - entry_price) * shares
@@ -216,7 +205,6 @@ def run_backtest(df, tp_pct, trade_dir, shares):
                     trades.append({'date': row['DisplayDate'], 'type': 'Sell', 'res': res_label, 'entry': entry_price, 'exit': st_val, 'profit': profit})
                     active_trade = None; trade_closed = True
         
-        # エントリー判定
         if active_trade is None and not trade_closed and sig is not None:
             if do_long and "BUY" in sig:
                 active_trade = {'entry_price': row['Close'], 'type': 'buy', 'target_tp': row['Close']*(1+tp_pct/100)}
@@ -228,10 +216,9 @@ def run_backtest(df, tp_pct, trade_dir, shares):
             if equity > peak_equity: peak_equity = equity
             dd = peak_equity - equity
             if dd > max_dd: max_dd = dd
-
     return trades, max_dd
 
-# --- スキャン機能 (売り対応) ---
+# --- スキャン機能 (日時明記) ---
 def scan_signals(tickers):
     history_buffer = []
     scan_bar = st.progress(0, text="全シグナル探索中...")
@@ -261,6 +248,7 @@ def scan_signals(tickers):
                     is_forming = (bars_ago == 0); status = "⚡日足形成" if is_forming else "🔒日足確定"
                     ago_label = "今日" if is_forming else f"{bars_ago}日前"
                     time_str = df_daily.index[i].strftime("%Y/%m/%d")
+                    
                     history_buffer.append({"dt": df_daily.index[i], "time_str": time_str, "code": t, "name": t_name, "sig": sig, "price": df_daily.iloc[i]['Close'], "status": status, "type": "SWING (日足)", "ago_label": ago_label})
                     
                     sig_id = f"{df_daily.index[i]}_{t}_{sig}_SWING"
@@ -281,7 +269,7 @@ def scan_signals(tickers):
                     
                     bars_ago = len(df_5m) - 1 - i
                     is_forming = (bars_ago == 0); status = "⚡5分形成" if is_forming else "🔒5分確定"
-                    time_str = df_5m.index[i].strftime("%Y/%m/%d %H:%M")
+                    time_str = df_5m.index[i].strftime("%m/%d %H:%M") # 時刻含む
                     history_buffer.append({"dt": df_5m.index[i], "time_str": time_str, "code": t, "name": t_name, "sig": sig, "price": df_5m.iloc[i]['Close'], "status": status, "type": "DAY-STD (5分)", "ago_label": f"{bars_ago*5}分前"})
                     
                     sig_id = f"{df_5m.index[i]}_{t}_{sig}_DAYSTD"
@@ -302,7 +290,7 @@ def scan_signals(tickers):
                     
                     bars_ago = len(df_1m) - 1 - i
                     is_forming = (bars_ago == 0); status = "⚡1分形成" if is_forming else "🔒1分確定"
-                    time_str = df_1m.index[i].strftime("%Y/%m/%d %H:%M")
+                    time_str = df_1m.index[i].strftime("%m/%d %H:%M") # 時刻含む
                     history_buffer.append({"dt": df_1m.index[i], "time_str": time_str, "code": t, "name": t_name, "sig": sig, "price": df_1m.iloc[i]['Close'], "status": status, "type": "DAY-FAST (1分)", "ago_label": f"{bars_ago}分前"})
                     
                     sig_id = f"{df_1m.index[i]}_{t}_{sig}_DAYFAST"
@@ -324,23 +312,29 @@ def display_signal_cards(signal_list, use_cols=4):
             color = "#d32f2f" if is_buy else "#00796b"
             icon = "🔥" if is_buy else "🧊"
             status_text = item.get('status', '履歴'); border = "dashed" if "形成" in status_text else "solid"
+            
             src_type = item.get('type', 'Unknown')
             if "SWING" in src_type: badge_style = "background-color:#3F51B5; color:white"
             elif "STD" in src_type: badge_style = "background-color:#4CAF50; color:white"
             else: badge_style = "background-color:#FF9800; color:white"
+            
+            # ★ 改良: 日付を2段目に大きく表示
             st.markdown(f"""
             <div style="border:2px {border} {color}; padding:10px; border-radius:8px; margin-bottom:10px; background-color:#262730;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
                     <span style="font-weight:bold; color:#fff; font-size:1.1em;">{item['name']}</span>
-                    <span style="{badge_style}; padding:2px 6px; border-radius:4px; font-size:0.75em;">{src_type}</span>
+                    <span style="{badge_style}; padding:2px 6px; border-radius:4px; font-size:0.7em;">{src_type}</span>
                 </div>
-                <div style="font-size:0.85em; color:#ddd;">{status_text} | {item.get('time_str')}</div>
-                <div style="color:{color}; font-weight:900; font-size:1.1em; margin: 5px 0;">{icon} {item['sig']}</div>
-                <div style="color:#fff; font-size:1.1em;">{item['price']:,.0f} 円</div>
+                <div style="color:#eee; font-weight:bold; font-size:1.0em; margin-bottom:5px;">{item.get('time_str')}</div>
+                <div style="color:{color}; font-weight:900; font-size:1.1em;">{icon} {item['sig']}</div>
+                <div style="display:flex; justify-content:space-between; align-items:end; margin-top:5px;">
+                    <span style="color:#fff; font-size:1.1em;">{item['price']:,.0f} 円</span>
+                    <span style="color:#aaa; font-size:0.8em;">{status_text}</span>
+                </div>
             </div>""", unsafe_allow_html=True)
 
 # --- レイアウト ---
-st.sidebar.title("💎 Watcher 23.1")
+st.sidebar.title("💎 Watcher 23.2")
 if st.sidebar.button("🔔 通知テスト"):
     if send_discord_notify("🔔 [TEST] System Normal."): st.sidebar.success("OK")
     else: st.sidebar.error("NG (Check Secrets)")
