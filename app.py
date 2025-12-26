@@ -7,28 +7,28 @@ import yfinance as yf
 import numpy as np
 from datetime import datetime, timedelta
 import os
-import requests  # ← これが必要です
+import requests
 import logic
 
 # --- 設定 ---
 CSV_FILE = "signals_history.csv"
 
-# --- Discord設定の読み込み (復活) ---
+# --- Discord設定 ---
 try:
     DISCORD_WEBHOOK_URL = st.secrets["DISCORD_URL"]
 except:
     DISCORD_WEBHOOK_URL = ""
 
 def send_discord_notify(msg):
-    """Discordにメッセージを送信する"""
     if not DISCORD_WEBHOOK_URL: return
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
     except:
         pass
 
-# --- 履歴管理 & 通知 ---
+# --- 履歴管理 & 通知 (修正版) ---
 def update_signal_history(current_results):
+    # CSV読み込み
     if os.path.exists(CSV_FILE):
         try:
             df_history = pd.read_csv(CSV_FILE, parse_dates=['time'])
@@ -41,36 +41,52 @@ def update_signal_history(current_results):
         new_items = []
         now = datetime.now()
         
-        # 新着チェック
         for item in current_results:
             is_duplicate = False
             
-            # 1. 履歴CSV内の重複チェック (60分以内)
+            # ★修正ポイント：全履歴データに対して重複チェックを行う
             if not df_history.empty:
-                recent = df_history[df_history['time'] >= (now - timedelta(minutes=60))]
-                matches = recent[(recent['code'].astype(str) == str(item['code'])) & (recent['sig'] == item['sig'])]
-                if not matches.empty: is_duplicate = True
+                # タイムスタンプ、コード、シグナル内容が完全に一致するものを探す
+                # (型の不一致を防ぐため、一度文字列に変換して比較します)
+                check_time = pd.to_datetime(item['time'])
+                
+                # 既存履歴の中で、条件に合うものを抽出
+                matches = df_history[
+                    (df_history['time'] == check_time) & 
+                    (df_history['code'].astype(str) == str(item['code'])) & 
+                    (df_history['sig'] == item['sig'])
+                ]
+                
+                if not matches.empty:
+                    is_duplicate = True
             
-            # 2. まだ通知していない場合のみ処理
+            # まだ履歴にない場合のみ追加・通知
             if not is_duplicate:
                 new_items.append(item)
                 
-                # ▼▼ ここで通知 (復活！) ▼▼
+                # 通知
                 msg = f"🦅 **{item['name']} ({item['code']})**\nシグナル: {item['sig']}\n価格: {item['price']:,.0f}円\nRSI: {item['rsi']:.1f}"
-                send_discord_notify(msg)       # Discordへ
-                st.toast(f"🔔 {item['name']}", icon="🦅") # 画面へ
+                send_discord_notify(msg)
+                st.toast(f"🔔 {item['name']}", icon="🦅")
 
-        # 新しいデータがあれば保存
+        # 新規データがあれば保存
         if new_items:
             df_new = pd.DataFrame(new_items)
             df_history = pd.concat([df_history, df_new], ignore_index=True)
+            
+            # 重複削除（念のため最後にまとめて）
+            df_history = df_history.drop_duplicates(subset=['time', 'code', 'sig'])
+            
+            # 1週間以上前を削除
             df_history = df_history[df_history['time'] >= (now - timedelta(days=7))]
+            
+            # ソートして保存
             df_history = df_history.sort_values('time', ascending=False)
             df_history.to_csv(CSV_FILE, index=False)
 
     return df_history
 
-# --- コックピット表示 ---
+# --- コックピット表示 (修正版) ---
 def display_signal_area(df_signals):
     if df_signals is None or df_signals.empty:
         st.info("現在、履歴にあるシグナルはありません。スキャン中...")
@@ -90,7 +106,15 @@ def display_signal_area(df_signals):
             with cols[i % 3]:
                 with st.container(border=True):
                     st.markdown(f"**{row['code']} {row['name']}**")
-                    st.caption(f"日時: {row['time'].strftime('%m/%d %H:%M')}")
+                    
+                    # ★修正ポイント：時間が00:00なら日付だけ表示
+                    t = row['time']
+                    if t.hour == 0 and t.minute == 0:
+                        time_str = t.strftime('%m/%d (日足)')
+                    else:
+                        time_str = t.strftime('%m/%d %H:%M')
+                        
+                    st.caption(f"日時: {time_str}")
                     st.error(f"{row['sig']}")
                     st.info(f"Price: {row['price']:,.0f} / RSI: {row['rsi']:.0f}")
     else:
@@ -99,7 +123,13 @@ def display_signal_area(df_signals):
     st.subheader("📜 過去1週間の履歴")
     if not df_past.empty:
         for i, row in df_past.iterrows():
-            d_str = row['time'].strftime('%m/%d %H:%M')
+            t = row['time']
+            # ★修正ポイント：リスト表示も同様
+            if t.hour == 0 and t.minute == 0:
+                d_str = t.strftime('%m/%d (日足)')
+            else:
+                d_str = t.strftime('%m/%d %H:%M')
+                
             st.markdown(f"・ {d_str} | **{row['code']} {row['name']}** | `{row['sig']}` (RSI: {row['rsi']:.0f})")
     else:
         st.text("過去の履歴はありません。")
@@ -107,7 +137,7 @@ def display_signal_area(df_signals):
 # ==========================================
 # メイン処理
 # ==========================================
-st.set_page_config(page_title="Trading Watcher V26.6", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="Trading Watcher V26.7", layout="wide", page_icon="🦅")
 st_autorefresh(interval=60*1000, key="auto_update")
 
 if 'notified_ids' not in st.session_state: st.session_state.notified_ids = set()
@@ -119,8 +149,7 @@ with st.spinner('🦅 全銘柄分析中...'):
     df_history = update_signal_history(current_results)
 
 # --- サイドバー ---
-st.sidebar.title("🦅 Watcher V26.6")
-# 通知テストボタン
+st.sidebar.title("🦅 Watcher V26.7")
 if st.sidebar.button("🔔 通知テスト"):
     send_discord_notify("🔔 [TEST] 通信テストOKです！")
     st.sidebar.success("送信しました")
