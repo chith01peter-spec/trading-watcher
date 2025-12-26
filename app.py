@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -7,7 +8,65 @@ import yfinance as yf
 import numpy as np
 import logic  # さっき作ったファイル
 
-# ページ設定
+# --- シグナル表示専用の関数（変数名をあなたのコードに合わせました） ---
+def display_signal_area(df_signals):
+    """
+    データフレームを受け取り、24時間以内はパネル、それ以前はリストで表示する
+    """
+    if df_signals.empty:
+        st.info("現在シグナルはありません。")
+        return
+
+    now = datetime.now()
+    threshold_24h = now - timedelta(hours=24)
+    threshold_1week = now - timedelta(days=7)
+
+    # データを分ける（'time'カラムを使用）
+    df_recent = df_signals[df_signals['time'] >= threshold_24h]
+    df_past = df_signals[(df_signals['time'] < threshold_24h) & (df_signals['time'] >= threshold_1week)]
+
+    # --- A. 【24時間以内】パネル表示 ---
+    st.subheader("🔔 直近24時間のシグナル")
+    
+    if not df_recent.empty:
+        # 新しい順に並び替え
+        df_recent = df_recent.sort_values('time', ascending=False)
+        
+        # 3列のカラムを作成してカード風に配置
+        cols = st.columns(3) 
+        for i, row in df_recent.iterrows():
+            col = cols[i % 3]
+            with col:
+                with st.container(border=True):
+                    # 銘柄名とコードを連結
+                    st.markdown(f"**{row['code']} {row['name']}**")
+                    # 日付時間を表示
+                    st.caption(f"日時: {row['time'].strftime('%Y-%m-%d %H:%M')}")
+                    # シグナル内容（'sig'カラムを使用）
+                    st.error(f"{row['sig']}")
+                    st.info(f"RSI: {row['rsi']:.1f}")
+    else:
+        st.info("直近24時間のシグナルはありません。")
+
+    # --- B. 【1週間以内】箇条書きリスト ---
+    st.subheader("📜 過去1週間の履歴")
+    
+    if not df_past.empty:
+        # 新しい順に並び替え
+        df_past = df_past.sort_values('time', ascending=False)
+
+        for i, row in df_past.iterrows():
+            date_str = row['time'].strftime('%Y-%m-%d %H:%M')
+            stock_str = f"{row['code']} {row['name']}"
+            
+            st.markdown(
+                f"・ {date_str} | **{stock_str}** | "
+                f"シグナル: `{row['sig']}` (RSI: {row['rsi']:.1f})"
+            )
+    else:
+        st.text("過去の履歴はありません。")
+
+# --- ページ設定 ---
 st.set_page_config(page_title="Trading Watcher V26.2 (Split)", layout="wide", page_icon="🦅")
 
 # --- Session State ---
@@ -40,22 +99,17 @@ with st.sidebar.expander("🛡 ロット計算"):
 # --- メイン画面 ---
 if mode == "🦅 コックピット":
     st.markdown("### 🦅 Market Cockpit")
+    
+    # データがある場合のみ処理
     if st.session_state.monitor_results:
+        # リストをDataFrameに変換
         df = pd.DataFrame(st.session_state.monitor_results)
-        df['時刻'] = df['time'].dt.strftime('%H:%M')
-        df['銘柄'] = df.apply(lambda x: f"{x['name']} ({x['code']})", axis=1)
-        df['価格'] = df['price'].apply(lambda x: f"{x:,.0f}")
-        df['損切'] = df['sl'].apply(lambda x: f"{x:,.0f}")
-        df['RSI'] = df['rsi'].apply(lambda x: f"{x:.0f}")
         
-        def highlight(row):
-            if 'BUY' in row['sig']: return ['background-color: #3d0000']*len(row)
-            if 'SELL' in row['sig']: return ['background-color: #001a3d']*len(row)
-            return ['']*len(row)
-            
-        st.dataframe(df[['時刻','銘柄','sig','価格','損切','RSI','note']].style.apply(highlight, axis=1), use_container_width=True, height=700)
+        # 新しい表示関数を呼び出し（ここで表示切替！）
+        display_signal_area(df)
+        
     else:
-        st.info("シグナルなし")
+        st.info("現在、監視対象のシグナルは検出されていません。")
 
 else: # 詳細分析
     st.markdown("### 🔍 詳細分析 & バックテスト")
