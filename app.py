@@ -33,7 +33,7 @@ def run_streamlit():
 run_streamlit()
 
 # ==========================================
-# V23.2 Trading Watcher (Clear Timestamp UI)
+# V23.3 Trading Watcher (Notification ID Fix)
 # ==========================================
 import streamlit as st
 import pandas as pd
@@ -44,7 +44,7 @@ from streamlit_autorefresh import st_autorefresh
 import numpy as np
 import requests
 
-st.set_page_config(page_title="Trading Watcher V23.2", layout="wide")
+st.set_page_config(page_title="Trading Watcher V23.3", layout="wide")
 
 # ==========================================
 # ★設定エリア
@@ -63,8 +63,11 @@ TICKER_NAMES = {
 }
 DEFAULT_FAVORITES = list(TICKER_NAMES.keys())
 
+# --- グローバルメモリ (重複通知防止・強化版) ---
 @st.cache_resource
-def get_global_state(): return {"notified_ids": set()}
+def get_global_state():
+    return {"notified_ids": set()}
+
 global_state = get_global_state()
 
 if 'favorites' not in st.session_state: st.session_state.favorites = DEFAULT_FAVORITES
@@ -218,12 +221,15 @@ def run_backtest(df, tp_pct, trade_dir, shares):
             if dd > max_dd: max_dd = dd
     return trades, max_dd
 
-# --- スキャン機能 (日時明記) ---
+# --- スキャン機能 (ID厳格化) ---
 def scan_signals(tickers):
     history_buffer = []
     scan_bar = st.progress(0, text="全シグナル探索中...")
     total = len(tickers)
     notified_set = global_state["notified_ids"]
+    
+    # 今日の日付 (YYYY-MM-DD)
+    today_str = datetime.now().strftime("%Y-%m-%d")
     
     for idx, t in enumerate(tickers):
         t_name = get_name(t)
@@ -238,26 +244,32 @@ def scan_signals(tickers):
             df_60m_chk = process_data(df_60m_chk, "60m")
             hourly_trend = "UP" if df_60m_chk.iloc[-1]['SuperTrend_Dir'] else "DOWN"
 
-        # 1. SWING
+        # 1. SWING (日足)
         df_daily = df_daily_chk
         if df_daily is not None and not df_daily.empty:
             for i in range(len(df_daily)-1, -1, -1):
                 sig = df_daily.iloc[i]['Trade_Signal']
                 if sig:
-                    bars_ago = len(df_daily) - 1 - i
-                    is_forming = (bars_ago == 0); status = "⚡日足形成" if is_forming else "🔒日足確定"
-                    ago_label = "今日" if is_forming else f"{bars_ago}日前"
-                    time_str = df_daily.index[i].strftime("%Y/%m/%d")
+                    # 日付の厳格な文字列化 (ID用)
+                    date_val = df_daily.index[i].strftime("%Y-%m-%d")
                     
-                    history_buffer.append({"dt": df_daily.index[i], "time_str": time_str, "code": t, "name": t_name, "sig": sig, "price": df_daily.iloc[i]['Close'], "status": status, "type": "SWING (日足)", "ago_label": ago_label})
+                    is_forming = (date_val == today_str) # 今日なら形成中
+                    status = "⚡日足形成" if is_forming else "🔒日足確定"
+                    ago_label = "今日" if is_forming else f"{date_val}"
                     
-                    sig_id = f"{df_daily.index[i]}_{t}_{sig}_SWING"
-                    if bars_ago == 1 and sig_id not in notified_set:
+                    history_buffer.append({"dt": df_daily.index[i], "time_str": date_val, "code": t, "name": t_name, "sig": sig, "price": df_daily.iloc[i]['Close'], "status": status, "type": "SWING (日足)", "ago_label": ago_label})
+                    
+                    # ★ ID生成: 日付文字列を使う (Timezone除外)
+                    sig_id = f"{date_val}_{t}_{sig}_SWING"
+                    
+                    # 通知条件: 確定足(昨日以前) かつ 未通知
+                    if not is_forming and sig_id not in notified_set:
                         emoji = "🌊" if "BUY" in sig else "📉"
-                        if send_discord_notify(f"**{emoji} [SWING] {sig} 確定**\n📅 {time_str}\n銘柄: {t_name}\n価格: {df_daily.iloc[i]['Close']:,.0f}円\n(日足: チャンス感知)"): notified_set.add(sig_id)
-                    if bars_ago > 7: break
+                        if send_discord_notify(f"**{emoji} [SWING] {sig} 確定**\n📅 {date_val}\n銘柄: {t_name}\n価格: {df_daily.iloc[i]['Close']:,.0f}円\n(日足: チャンス感知)"):
+                            notified_set.add(sig_id)
+                    if i < len(df_daily) - 7: break # 直近7日分まで
 
-        # 2. DAY-STD
+        # 2. DAY-STD (5分)
         df_5m = get_data(t, "5d", "5m")
         if df_5m is not None and not df_5m.empty:
             df_5m = process_data(df_5m, "5m")
@@ -269,16 +281,17 @@ def scan_signals(tickers):
                     
                     bars_ago = len(df_5m) - 1 - i
                     is_forming = (bars_ago == 0); status = "⚡5分形成" if is_forming else "🔒5分確定"
-                    time_str = df_5m.index[i].strftime("%m/%d %H:%M") # 時刻含む
+                    time_str = df_5m.index[i].strftime("%Y-%m-%d %H:%M") # 分単位まで
                     history_buffer.append({"dt": df_5m.index[i], "time_str": time_str, "code": t, "name": t_name, "sig": sig, "price": df_5m.iloc[i]['Close'], "status": status, "type": "DAY-STD (5分)", "ago_label": f"{bars_ago*5}分前"})
                     
-                    sig_id = f"{df_5m.index[i]}_{t}_{sig}_DAYSTD"
+                    sig_id = f"{time_str}_{t}_{sig}_DAYSTD"
                     if bars_ago == 1 and sig_id not in notified_set:
                         emoji = "🟢" if "BUY" in sig else "🔴"
-                        if send_discord_notify(f"**{emoji} [DAY-STD] {sig} 確定**\n⏰ {time_str}\n銘柄: {t_name}\n価格: {df_5m.iloc[i]['Close']:,.0f}円\n(5分足: 中期トレンド一致)"): notified_set.add(sig_id)
+                        if send_discord_notify(f"**{emoji} [DAY-STD] {sig} 確定**\n⏰ {time_str}\n銘柄: {t_name}\n価格: {df_5m.iloc[i]['Close']:,.0f}円\n(5分足: 中期トレンド一致)"):
+                            notified_set.add(sig_id)
                     if bars_ago > 12: break
 
-        # 3. DAY-FAST
+        # 3. DAY-FAST (1分)
         df_1m = get_data(t, "5d", "1m")
         if df_1m is not None and not df_1m.empty:
             df_1m = process_data(df_1m, "1m")
@@ -290,13 +303,14 @@ def scan_signals(tickers):
                     
                     bars_ago = len(df_1m) - 1 - i
                     is_forming = (bars_ago == 0); status = "⚡1分形成" if is_forming else "🔒1分確定"
-                    time_str = df_1m.index[i].strftime("%m/%d %H:%M") # 時刻含む
+                    time_str = df_1m.index[i].strftime("%Y-%m-%d %H:%M")
                     history_buffer.append({"dt": df_1m.index[i], "time_str": time_str, "code": t, "name": t_name, "sig": sig, "price": df_1m.iloc[i]['Close'], "status": status, "type": "DAY-FAST (1分)", "ago_label": f"{bars_ago}分前"})
                     
-                    sig_id = f"{df_1m.index[i]}_{t}_{sig}_DAYFAST"
+                    sig_id = f"{time_str}_{t}_{sig}_DAYFAST"
                     if bars_ago == 1 and sig_id not in notified_set:
                         emoji = "🔥" if "BUY" in sig else "❄️"
-                        if send_discord_notify(f"**{emoji} [DAY-FAST] {sig} 確定**\n⏰ {time_str}\n銘柄: {t_name}\n価格: {df_1m.iloc[i]['Close']:,.0f}円\n(1分足: 厳格条件突破)"): notified_set.add(sig_id)
+                        if send_discord_notify(f"**{emoji} [DAY-FAST] {sig} 確定**\n⏰ {time_str}\n銘柄: {t_name}\n価格: {df_1m.iloc[i]['Close']:,.0f}円\n(1分足: 厳格条件突破)"):
+                            notified_set.add(sig_id)
                     if bars_ago > 10: break
 
     scan_bar.empty()
@@ -312,18 +326,15 @@ def display_signal_cards(signal_list, use_cols=4):
             color = "#d32f2f" if is_buy else "#00796b"
             icon = "🔥" if is_buy else "🧊"
             status_text = item.get('status', '履歴'); border = "dashed" if "形成" in status_text else "solid"
-            
             src_type = item.get('type', 'Unknown')
             if "SWING" in src_type: badge_style = "background-color:#3F51B5; color:white"
             elif "STD" in src_type: badge_style = "background-color:#4CAF50; color:white"
             else: badge_style = "background-color:#FF9800; color:white"
-            
-            # ★ 改良: 日付を2段目に大きく表示
             st.markdown(f"""
             <div style="border:2px {border} {color}; padding:10px; border-radius:8px; margin-bottom:10px; background-color:#262730;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
                     <span style="font-weight:bold; color:#fff; font-size:1.1em;">{item['name']}</span>
-                    <span style="{badge_style}; padding:2px 6px; border-radius:4px; font-size:0.7em;">{src_type}</span>
+                    <span style="{badge_style}; padding:2px 6px; border-radius:4px; font-size:0.75em;">{src_type}</span>
                 </div>
                 <div style="color:#eee; font-weight:bold; font-size:1.0em; margin-bottom:5px;">{item.get('time_str')}</div>
                 <div style="color:{color}; font-weight:900; font-size:1.1em;">{icon} {item['sig']}</div>
@@ -334,7 +345,7 @@ def display_signal_cards(signal_list, use_cols=4):
             </div>""", unsafe_allow_html=True)
 
 # --- レイアウト ---
-st.sidebar.title("💎 Watcher 23.2")
+st.sidebar.title("💎 Watcher 23.3")
 if st.sidebar.button("🔔 通知テスト"):
     if send_discord_notify("🔔 [TEST] System Normal."): st.sidebar.success("OK")
     else: st.sidebar.error("NG (Check Secrets)")
