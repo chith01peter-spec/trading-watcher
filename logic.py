@@ -3,7 +3,7 @@ import yfinance as yf
 import numpy as np
 from datetime import datetime, timedelta
 
-# --- 監視対象リスト (ここにある銘柄が"全銘柄"です) ---
+# --- 監視対象リスト ---
 TICKER_NAMES = {
     "9984": "ソフトバンクG", "6857": "アドバンテスト", "5803": "フジクラ",
     "6920": "レーザーテック", "3563": "F&L (スシロー)", "8385": "伊予銀行",
@@ -19,7 +19,7 @@ WATCH_LIST = list(TICKER_NAMES.keys())
 def get_name(code):
     return TICKER_NAMES.get(code, code)
 
-# --- データ取得 ---
+# --- データ取得 (時刻修正強化版) ---
 def get_data(ticker, period, interval):
     try:
         ticker_mod = f"{ticker}.T" if ".T" not in ticker and ticker.isdigit() else ticker
@@ -31,9 +31,22 @@ def get_data(ticker, period, interval):
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df = df.loc[:, ~df.columns.duplicated()]
         
-        # タイムゾーンを統一 (timezone-naiveに変換して扱いやすくする)
+        # ★ タイムゾーン強制補正
+        # yfinanceの短期足はタイムゾーンなしのUTCで来ることがあるため、JSTに変換
+        if df.index.tz is None:
+            # 短期足(日足以外)ならUTCとみなしてJST(+9h)へ変換
+            if "m" in interval or "h" in interval: 
+                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Tokyo')
+            else:
+                # 日足などはローカル日付なのでそのままでよいが念の為JST化
+                pass
+        else:
+            # 既にタイムゾーン情報があればJSTへ変換
+            df.index = df.index.tz_convert('Asia/Tokyo')
+
+        # 扱いやすくするためタイムゾーン情報を削除（NaiveなJST時刻にする）
         if df.index.tz is not None:
-            df.index = df.index.tz_convert('Asia/Tokyo').tz_localize(None)
+            df.index = df.index.tz_localize(None)
             
         return df
     except:
@@ -148,29 +161,28 @@ def run_backtest(df, tp_pct, trade_dir, shares):
 
     return trades, max_dd
 
-# --- ★ここが修正点：過去に遡ってスキャン ---
+# --- 全銘柄スキャン実行 ---
 def scan_market(notified_ids):
     results = []
     new_notified = notified_ids.copy()
-    
-    # 処理が重くなりすぎないよう、チェックする過去の範囲を制限
     scan_limit_days = 5 
     
+    # ★ ここでもJSTの現在時刻を確実に取得する
+    now = pd.Timestamp.now(tz='Asia/Tokyo').tz_localize(None)
+
     for t in WATCH_LIST:
         t_name = get_name(t)
         
-        # 1. 日足スキャン (過去3ヶ月分取得して、直近5日間のシグナルを見る)
+        # 1. 日足スキャン
         try:
             df = get_data(t, "3mo", "1d")
             if df is not None and not df.empty:
                 df = calculate_technical_indicators(df)
-                # 直近 scan_limit_days 分の日足をチェック
                 recent_df = df.iloc[-scan_limit_days:]
                 
                 for date, row in recent_df.iterrows():
                     sig = row['Trade_Signal']
                     if sig and "SWING" in sig:
-                        # IDに日付を含めて重複防止
                         sig_id = f"{date}_{t}_{sig}"
                         if sig_id not in new_notified:
                             results.append({
@@ -180,12 +192,12 @@ def scan_market(notified_ids):
                             new_notified.add(sig_id)
         except: pass
 
-        # 2. 60分足スキャン (Dayトレード用)
+        # 2. 60分足スキャン
         try:
             df = get_data(t, "1mo", "60m")
             if df is not None and not df.empty:
                 df = calculate_technical_indicators(df)
-                recent_df = df.iloc[-24:] # 直近24時間分（約24本）をチェック
+                recent_df = df.iloc[-24:] 
                 
                 for date, row in recent_df.iterrows():
                     sig = row['Trade_Signal']
@@ -199,6 +211,5 @@ def scan_market(notified_ids):
                             new_notified.add(sig_id)
         except: pass
         
-    # 結果を時間の新しい順にソート
     results.sort(key=lambda x: x['time'], reverse=True)
     return results, new_notified
