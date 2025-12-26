@@ -1,221 +1,279 @@
-import streamlit as st
 import pandas as pd
 import yfinance as yf
 import numpy as np
-import requests
 from datetime import datetime, timedelta
 
-# ==========================================
-# ⚙️ 設定 & 定数
-# ==========================================
-try:
-    DISCORD_WEBHOOK_URL = st.secrets["DISCORD_URL"]
-except:
-    DISCORD_WEBHOOK_URL = ""
-
-# 💎 宋スペシャル・パック (50銘柄)
-WATCH_LIST = [
-    "9984", "6857", "5803", "6920", "3563", "8385", "5020", "8136", "3778", 
-    "9107", "7011", "8035", "8306", "7203", "6146", "6526", "7735", "6723", 
-    "6758", "6367", "8316", "8411", "8001", "8002", "8058", "7012", "7013",
-    "5253", "5032", "5574", "9166", "2160", "2413", "4385", "4483", "9613",
-    "9983", "7974", "4661", "3099", "3382", "8267", "9843", "9501", "7267", 
-    "6501", "6701", "4502", "4568", "2914", "4911"
-]
-WATCH_LIST = sorted(list(set(WATCH_LIST)))
-
-TICKER_MAP = {
-    "9984": "SBG", "6857": "アドバン", "6920": "レーザー", "8306": "三菱UFJ", 
-    "8035": "東エレク", "6146": "ディスコ", "6526": "ソシオ", "7735": "SCREEN",
-    "5253": "カバー", "5032": "ANYCOLOR", "9166": "GENDA", "7011": "三菱重", 
-    "5803": "フジクラ", "8001": "伊藤忠", "9107": "川崎船", "7203": "トヨタ",
-    "8316": "三井住友", "8058": "三菱商", "4661": "OLC", "7974": "任天堂"
+# --- 定数設定 ---
+TICKER_NAMES = {
+    "9984": "ソフトバンクG", "6857": "アドバンテスト", "5803": "フジクラ",
+    "6920": "レーザーテック", "3563": "F&L (スシロー)", "8385": "伊予銀行",
+    "5020": "ENEOS", "8136": "サンリオ", "3778": "さくらネット",
+    "9107": "川崎汽船", "7011": "三菱重工", "8035": "東エレク",
+    "8306": "三菱UFJ", "7203": "トヨタ自動車"
 }
+WATCH_LIST = list(TICKER_NAMES.keys())
 
 def get_name(code):
-    return TICKER_MAP.get(code, code)
+    return TICKER_NAMES.get(code, code)
 
-# ==========================================
-# 📊 テクニカル計算ロジック
-# ==========================================
+# --- データ取得 ---
+def get_data(ticker, period, interval):
+    try:
+        ticker_mod = f"{ticker}.T" if ".T" not in ticker and ticker.isdigit() else ticker
+        df = yf.download(ticker_mod, period=period, interval=interval, progress=False, auto_adjust=False)
+        
+        if df.empty: return None
+
+        # MultiIndex解除
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        
+        df = df.loc[:, ~df.columns.duplicated()]
+        
+        # タイムゾーン処理
+        if df.index.tz is None:
+            df.index = df.index.tz_localize('Asia/Tokyo')
+        else:
+            df.index = df.index.tz_convert('Asia/Tokyo')
+            
+        return df
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+# --- テクニカル計算 ---
 def calculate_technical_indicators(df):
-    if df is None or df.empty: return None
     df = df.copy()
     
+    # 表示用日付フォーマット
+    interval_check = df.index.to_series().diff().min()
+    if interval_check < timedelta(days=1):
+        df['DisplayDate'] = df.index.strftime('%m/%d %H:%M')
+    else:
+        df['DisplayDate'] = df.index.strftime('%Y/%m/%d')
+
     # VWAP
     try:
-        v = df['Volume']
-        tp = (df['High'] + df['Low'] + df['Close']) / 3
+        v = df['Volume'].squeeze()
+        tp = ((df['High'] + df['Low'] + df['Close']) / 3).squeeze()
         df['VWAP'] = (tp * v).cumsum() / v.cumsum()
-    except: df['VWAP'] = np.nan
+    except:
+        df['VWAP'] = np.nan
 
-    # MACD
-    close = df['Close']
-    df['MACD'] = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    # ATR & ADX
+    high, low, close = df['High'], df['Low'], df['Close']
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean()
+
+    up = high.diff()
+    down = low.diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0)
+    plus_dm = pd.Series(plus_dm, index=df.index)
+    minus_dm = pd.Series(minus_dm, index=df.index)
+    
+    plus_di = 100 * (plus_dm.ewm(alpha=1/14).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/14).mean() / atr)
+    dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di)) * 100
+    df['ADX'] = dx.ewm(alpha=1/14).mean()
+
+    # MACD & RSI
+    exp12 = close.ewm(span=12, adjust=False).mean()
+    exp26 = close.ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp12 - exp26
     df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-    # RSI
+    
     delta = close.diff()
     gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
     loss = -delta.where(delta < 0, 0).ewm(alpha=1/14, adjust=False).mean()
     df['RSI'] = 100 - (100 / (1 + gain/loss))
 
-    # ADX & SuperTrend (Simplified Loop for Batch Speed)
-    high = df['High']; low = df['Low']
-    tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean()
-    
-    # ADX
-    up = high.diff(); down = -low.diff()
-    p_dm = np.where((up > down) & (up > 0), up, 0)
-    m_dm = np.where((down > up) & (down > 0), down, 0)
-    p_di = 100 * (pd.Series(p_dm, index=df.index).ewm(alpha=1/14).mean() / atr)
-    m_di = 100 * (pd.Series(m_dm, index=df.index).ewm(alpha=1/14).mean() / atr)
-    df['ADX'] = (abs(p_di - m_di) / abs(p_di + m_di) * 100).ewm(alpha=1/14).mean()
-
-    # SuperTrend (Period=10, Mult=3)
-    # ループ計算を関数内で高速に行う
-    basic_upper = (high + low) / 2 + (3 * tr.rolling(10).mean())
-    basic_lower = (high + low) / 2 - (3 * tr.rolling(10).mean())
+    # SuperTrend
+    period_st = 10
+    multiplier = 3.0
+    atr_st = tr.rolling(period_st).mean()
+    hl2 = (high + low) / 2
+    basic_upper = hl2 + (multiplier * atr_st)
+    basic_lower = hl2 - (multiplier * atr_st)
     
     supertrend = [np.nan] * len(df)
     trend_dir = [True] * len(df)
-    curr_trend = True
-    curr_st = basic_lower.iloc[0] if not pd.isna(basic_lower.iloc[0]) else 0
-    
+    final_upper = [np.nan] * len(df)
+    final_lower = [np.nan] * len(df)
+
     for i in range(len(df)):
-        if pd.isna(basic_upper.iloc[i]): continue
-        c = close.iloc[i]
+        if i < period_st:
+            final_upper[i] = basic_upper.iloc[i]
+            final_lower[i] = basic_lower.iloc[i]
+            continue
+
+        prev_close = close.iloc[i-1]
         
-        # Upper/Lower Logic
-        u = basic_upper.iloc[i]
-        l = basic_lower.iloc[i]
-        # (簡易化のため直近値比較のみ実装)
-        
-        if curr_trend: # UP
-            if c < curr_st: curr_trend = False; curr_st = u
-            else: curr_st = max(curr_st, l)
-        else: # DOWN
-            if c > curr_st: curr_trend = True; curr_st = l
-            else: curr_st = min(curr_st, u)
+        # Upper Band
+        if basic_upper.iloc[i] < final_upper[i-1] or prev_close > final_upper[i-1]:
+            final_upper[i] = basic_upper.iloc[i]
+        else:
+            final_upper[i] = final_upper[i-1]
             
-        supertrend[i] = curr_st
-        trend_dir[i] = curr_trend
-        
+        # Lower Band
+        if basic_lower.iloc[i] > final_lower[i-1] or prev_close < final_lower[i-1]:
+            final_lower[i] = basic_lower.iloc[i]
+        else:
+            final_lower[i] = final_lower[i-1]
+
+        # Trend Direction
+        if trend_dir[i-1]:
+            trend_dir[i] = False if close.iloc[i] < final_lower[i] else True
+        else:
+            trend_dir[i] = True if close.iloc[i] > final_upper[i] else False
+            
+        supertrend[i] = final_lower[i] if trend_dir[i] else final_upper[i]
+
     df['SuperTrend'] = supertrend
     df['SuperTrend_Dir'] = trend_dir
     
-    # Signals
-    sigs = []
-    for i in range(len(df)):
-        if i < 30: sigs.append(None); continue
-        r = df.iloc[i]; p = df.iloc[i-1]
-        s = None
-        gc = p['MACD'] < p['Signal'] and r['MACD'] > r['Signal']
-        dc = p['MACD'] > p['Signal'] and r['MACD'] < r['Signal']
-        if r['SuperTrend_Dir'] and gc: s = "BUY"
-        elif not r['SuperTrend_Dir'] and dc: s = "SELL"
-        sigs.append(s)
-    df['Trade_Signal'] = sigs
+    # シグナル判定
+    signals = []
+    # データ間隔推定 (日足かどうか)
+    is_daily = (df.index[1] - df.index[0]) >= timedelta(hours=23) if len(df) > 1 else True
     
+    for i in range(len(df)):
+        if i < 30:
+            signals.append(None)
+            continue
+            
+        row = df.iloc[i]
+        prev = df.iloc[i-1]
+        sig = None
+        
+        # クロス判定
+        g_cross = prev['MACD'] < prev['Signal'] and row['MACD'] > row['Signal']
+        d_cross = prev['MACD'] > prev['Signal'] and row['MACD'] < row['Signal']
+        is_uptrend = row['SuperTrend_Dir']
+        
+        if is_daily:
+            if is_uptrend and g_cross: sig = 'SWING_BUY'
+            elif not is_uptrend and d_cross: sig = 'SWING_SELL'
+            elif row['RSI'] < 30 and row['Close'] > prev['Close']: sig = 'SWING_BUY (RSI)'
+            elif row['RSI'] > 70 and row['Close'] < prev['Close']: sig = 'SWING_SELL (RSI)'
+        else:
+            # 短期足条件
+            if pd.isna(row['ADX']) or pd.isna(row['VWAP']):
+                signals.append(None)
+                continue
+            
+            adx_ok = row['ADX'] > 25
+            buy_vwap = row['Close'] > row['VWAP']
+            sell_vwap = row['Close'] < row['VWAP']
+            
+            if is_uptrend and g_cross and adx_ok and buy_vwap: sig = 'DAY_BUY'
+            elif not is_uptrend and d_cross and adx_ok and sell_vwap: sig = 'DAY_SELL'
+            
+        signals.append(sig)
+        
+    df['Trade_Signal'] = signals
     return df
 
-# ==========================================
-# 📡 データ取得・スキャン・通知
-# ==========================================
-def send_discord(msg):
-    if not DISCORD_WEBHOOK_URL: return False
-    try: requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}); return True
-    except: return False
+# --- バックテスト ---
+def run_backtest(df, tp_pct, trade_dir, shares):
+    trades = []
+    active_trade = None 
+    do_long = "買い" in trade_dir
+    do_short = "売り" in trade_dir
+    
+    max_dd = 0
+    peak_equity = 0
+    equity = 0
+    
+    for i in range(len(df)):
+        row = df.iloc[i]
+        sig = row['Trade_Signal']
+        st_val = row['SuperTrend']
+        trade_closed = False
+        profit = 0
+        
+        # 決済チェック
+        if active_trade:
+            entry_price = active_trade['entry_price']
+            entry_tp = active_trade['target_tp']
+            
+            if active_trade['type'] == 'buy':
+                if row['High'] >= entry_tp:
+                    profit = (entry_tp - entry_price) * shares
+                    trades.append({'date': row['DisplayDate'], 'type': 'Buy', 'res': 'WIN 🏆', 'profit': profit})
+                    active_trade = None; trade_closed = True
+                elif row['Close'] < st_val:
+                    profit = (st_val - entry_price) * shares
+                    res = 'WIN (Trail)' if profit > 0 else 'LOSE'
+                    trades.append({'date': row['DisplayDate'], 'type': 'Buy', 'res': res, 'profit': profit})
+                    active_trade = None; trade_closed = True
+                    
+            elif active_trade['type'] == 'sell':
+                if row['Low'] <= entry_tp:
+                    profit = (entry_price - entry_tp) * shares
+                    trades.append({'date': row['DisplayDate'], 'type': 'Sell', 'res': 'WIN 🏆', 'profit': profit})
+                    active_trade = None; trade_closed = True
+                elif row['Close'] > st_val:
+                    profit = (entry_price - st_val) * shares
+                    res = 'WIN (Trail)' if profit > 0 else 'LOSE'
+                    trades.append({'date': row['DisplayDate'], 'type': 'Sell', 'res': res, 'profit': profit})
+                    active_trade = None; trade_closed = True
 
-@st.cache_data(ttl=30)
-def fetch_batch_data(tickers):
-    try:
-        ts = [f"{t}.T" for t in tickers]
-        return yf.download(ts, period="5d", interval="5m", group_by='ticker', auto_adjust=False, progress=False, threads=True)
-    except: return None
+        if trade_closed:
+            equity += profit
+            if equity > peak_equity: peak_equity = equity
+            dd = peak_equity - equity
+            if dd > max_dd: max_dd = dd
 
+        # エントリーチェック
+        if active_trade is None and not trade_closed and sig is not None:
+            if do_long and "BUY" in sig:
+                active_trade = {'entry_price': row['Close'], 'type': 'buy', 'target_tp': row['Close']*(1+tp_pct/100)}
+            elif do_short and "SELL" in sig:
+                active_trade = {'entry_price': row['Close'], 'type': 'sell', 'target_tp': row['Close']*(1-tp_pct/100)}
+                
+    return trades, max_dd
+
+# --- スキャンロジック ---
 def scan_market(notified_ids):
-    data = fetch_batch_data(WATCH_LIST)
-    if data is None: return [], notified_ids
-    
     results = []
-    now = pd.Timestamp.now(tz='Asia/Tokyo')
+    new_notified = notified_ids.copy()
+    now_jst = pd.Timestamp.now(tz='Asia/Tokyo')
     
-    for code in WATCH_LIST:
+    # 簡易スキャンループ（UI表示はapp.pyで担当するため、ここではデータ作成に集中）
+    for t in WATCH_LIST:
+        t_name = get_name(t)
+        
+        # 直近のデータを取得してシグナルがあるか見る
+        # ここでは軽量化のため5分足だけチェックする例
         try:
-            key = f"{code}.T"
-            if key not in data['Close'].columns: continue
+            df = get_data(t, "5d", "5m")
+            if df is None or df.empty: continue
+            df = calculate_technical_indicators(df)
             
-            df_t = pd.DataFrame({
-                'Open': data['Open'][key], 'High': data['High'][key],
-                'Low': data['Low'][key], 'Close': data['Close'][key],
-                'Volume': data['Volume'][key]
-            }).dropna()
-            
-            if df_t.empty: continue
-            if df_t.index.tz is None: df_t.index = df_t.index.tz_localize('Asia/Tokyo')
-            else: df_t.index = df_t.index.tz_convert('Asia/Tokyo')
-
-            df_calc = calculate_technical_indicators(df_t)
-            if df_calc is None: continue
-            
-            row = df_calc.iloc[-1]
+            # 最新の確定足（最後から2番目）を見る
+            row = df.iloc[-2] 
             sig = row['Trade_Signal']
             
             if sig:
-                note = []
-                if row['RSI'] > 75: note.append("⚠️RSI過熱")
-                if row['RSI'] < 25: note.append("⚠️RSI底")
-                if row['ADX'] < 20: note.append("📉レンジ")
-                note_str = " ".join(note)
-                
-                results.append({
-                    "code": code, "name": get_name(code), "time": row.name,
-                    "sig": sig, "price": row['Close'], "rsi": row['RSI'],
-                    "sl": row['SuperTrend'], "note": note_str
-                })
-                
-                # 通知
-                sig_id = f"{row.name}_{code}_{sig}"
-                if (now - row.name) < timedelta(minutes=30) and sig_id not in notified_ids:
-                    emoji = "🚀" if "BUY" in sig else "🥀"
-                    msg = f"**{emoji} {get_name(code)} {sig}**\n値: {row['Close']:,.0f} | RSI:{row['RSI']:.0f}\n損切: {row['SuperTrend']:,.0f}\n{note_str}"
-                    if send_discord(msg): notified_ids.add(sig_id)
-        except: continue
-        
-    results.sort(key=lambda x: x['time'], reverse=True)
-    return results, notified_ids
-
-# ==========================================
-# 🧪 バックテスト
-# ==========================================
-def run_backtest(df, tp_pct, trade_dir, shares):
-    trades = []; active = None
-    do_long = "買い" in trade_dir or "両方" in trade_dir
-    do_short = "売り" in trade_dir or "両方" in trade_dir
-    max_dd = 0; peak = 0; equity = 0
-    
-    for i in range(len(df)):
-        row = df.iloc[i]; sig = row['Trade_Signal']; st_v = row['SuperTrend']
-        closed = False; profit = 0
-        
-        if active:
-            ep = active['price']; tp = active['tp']
-            if active['type'] == 'buy':
-                if row['High'] >= tp: profit=(tp-ep)*shares; closed=True; res="WIN🏆"
-                elif row['Close'] < st_v: profit=(st_v-ep)*shares; closed=True; res="Trail"
-            elif active['type'] == 'sell':
-                if row['Low'] <= tp: profit=(ep-tp)*shares; closed=True; res="WIN🏆"
-                elif row['Close'] > st_v: profit=(ep-st_v)*shares; closed=True; res="Trail"
+                # 重複通知防止
+                sig_id = f"{row.name}_{t}_{sig}"
+                if sig_id not in new_notified:
+                    results.append({
+                        "time": row.name,
+                        "code": t,
+                        "name": t_name,
+                        "sig": sig,
+                        "price": row['Close'],
+                        "sl": row['SuperTrend'],
+                        "rsi": row['RSI'],
+                        "note": "新規検出"
+                    })
+                    new_notified.add(sig_id)
+        except:
+            continue
             
-            if closed:
-                trades.append({'date':row.name, 'type':active['type'], 'res':res, 'profit':profit, 'entry':ep, 'exit':tp if "WIN" in res else st_v})
-                active = None; equity += profit
-                peak = max(peak, equity); max_dd = max(max_dd, peak-equity)
-        
-        if not active and sig:
-            if do_long and "BUY" in sig: active={'type':'buy', 'price':row['Close'], 'tp':row['Close']*(1+tp_pct/100)}
-            elif do_short and "SELL" in sig: active={'type':'sell', 'price':row['Close'], 'tp':row['Close']*(1-tp_pct/100)}
-            
-    return trades, max_dd
+    return results, new_notified
