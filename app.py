@@ -33,7 +33,7 @@ def run_streamlit():
 run_streamlit()
 
 # ==========================================
-# V22.0 Trading Watcher (Cloud Ready / Secrets対応版)
+# V23.1 Trading Watcher (Full Spec: Buy & Sell Restored)
 # ==========================================
 import streamlit as st
 import pandas as pd
@@ -44,16 +44,14 @@ from streamlit_autorefresh import st_autorefresh
 import numpy as np
 import requests
 
-st.set_page_config(page_title="Trading Watcher V22 (Cloud)", layout="wide")
+st.set_page_config(page_title="Trading Watcher V23.1", layout="wide")
 
 # ==========================================
-# ★設定エリア (クラウドのSecretsから読み込む安全設計)
+# ★設定エリア
 # ==========================================
 try:
-    # Streamlit Cloudの「Secrets」設定からURLを取得
     DISCORD_WEBHOOK_URL = st.secrets["DISCORD_URL"]
 except:
-    # ローカルや設定忘れの場合は空にする（エラー落ち防止）
     DISCORD_WEBHOOK_URL = ""
 
 TICKER_NAMES = {
@@ -65,11 +63,13 @@ TICKER_NAMES = {
 }
 DEFAULT_FAVORITES = list(TICKER_NAMES.keys())
 
+@st.cache_resource
+def get_global_state(): return {"notified_ids": set()}
+global_state = get_global_state()
+
 if 'favorites' not in st.session_state: st.session_state.favorites = DEFAULT_FAVORITES
 if 'current_ticker' not in st.session_state: st.session_state.current_ticker = "9984"
-if 'notified_signals' not in st.session_state: st.session_state.notified_signals = set()
 if 'bt_results' not in st.session_state: st.session_state.bt_results = None
-if 'alert_history' not in st.session_state: st.session_state.alert_history = []
 
 def get_name(code): return TICKER_NAMES.get(code, code)
 
@@ -144,52 +144,48 @@ def process_data(df, interval):
         supertrend[i] = final_lower[i] if trend_dir[i] else final_upper[i]
     df['SuperTrend'] = supertrend; df['SuperTrend_Dir'] = trend_dir
 
-    # ★ 3層シグナル判定ロジック
+    # ★ 3層シグナル判定 (売り復活)
     signals = []
-    is_daily = "d" in interval # 日足
-    is_5m = "5m" in interval   # 5分足
-
+    is_daily = "d" in interval; is_5m = "5m" in interval
     for i in range(len(df)):
         if i < 30: signals.append(None); continue
         row = df.iloc[i]; prev = df.iloc[i-1]
         sig = None
-        
-        is_uptrend = row['SuperTrend_Dir'] == True
-        is_downtrend = row['SuperTrend_Dir'] == False
+        is_uptrend = row['SuperTrend_Dir'] == True; is_downtrend = row['SuperTrend_Dir'] == False
         g_cross = prev['MACD'] < prev['Signal'] and row['MACD'] > row['Signal']
         d_cross = prev['MACD'] > prev['Signal'] and row['MACD'] < row['Signal']
         
         if is_daily:
-            # 🐢 SWING (日足) - 緩和モード
+            # 🐢 SWING
             if is_uptrend and g_cross: sig = 'SWING_BUY'
-            elif is_downtrend and d_cross: sig = 'SWING_SELL'
+            elif is_downtrend and d_cross: sig = 'SWING_SELL' # 復活
             elif row['RSI'] < 30 and row['Close'] > prev['Close']: sig = 'SWING_BUY (RSI)'
-            elif row['RSI'] > 70 and row['Close'] < prev['Close']: sig = 'SWING_SELL (RSI)'
+            elif row['RSI'] > 70 and row['Close'] < prev['Close']: sig = 'SWING_SELL (RSI)' # 復活
             elif row['SuperTrend_Dir'] == True and prev['SuperTrend_Dir'] == False: sig = 'SWING_BUY (Trend)'
-            elif row['SuperTrend_Dir'] == False and prev['SuperTrend_Dir'] == True: sig = 'SWING_SELL (Trend)'
+            elif row['SuperTrend_Dir'] == False and prev['SuperTrend_Dir'] == True: sig = 'SWING_SELL (Trend)' # 復活
         
         elif is_5m:
-            # 🛡️ DAY-STD (5分足) - 標準モード
+            # 🛡️ DAY-STD
             if is_uptrend and g_cross: sig = 'DAY_BUY'
-            elif is_downtrend and d_cross: sig = 'DAY_SELL'
+            elif is_downtrend and d_cross: sig = 'DAY_SELL' # 復活
             
         else:
-            # ⚡ DAY-FAST (1分足) - 厳格モード
+            # ⚡ DAY-FAST
             if pd.isna(row['ADX']) or pd.isna(row['VWAP']): signals.append(None); continue
             adx_ok = row['ADX'] > 25
             buy_vwap_ok = row['Close'] > row['VWAP']; sell_vwap_ok = row['Close'] < row['VWAP']
             if is_uptrend and g_cross and adx_ok and buy_vwap_ok: sig = 'SCALP_BUY'
-            elif is_downtrend and d_cross and adx_ok and sell_vwap_ok: sig = 'SCALP_SELL'
+            elif is_downtrend and d_cross and adx_ok and sell_vwap_ok: sig = 'SCALP_SELL' # 復活
             
         signals.append(sig)
     
     df['Trade_Signal'] = signals
     return df
 
-# --- バックテスト ---
+# --- バックテスト (売買両対応) ---
 def run_backtest(df, tp_pct, trade_dir, shares):
     trades = []; active_trade = None 
-    do_long = "買い" in trade_dir
+    do_long = "買い" in trade_dir; do_short = "売り" in trade_dir
     max_dd = 0; peak_equity = 0; equity = 0
 
     for i in range(len(df)):
@@ -198,6 +194,7 @@ def run_backtest(df, tp_pct, trade_dir, shares):
 
         if active_trade:
             entry_price = active_trade['entry_price']; entry_tp = active_trade['target_tp']
+            # 利確/損切り判定
             if active_trade['type'] == 'buy':
                 if row['High'] >= entry_tp:
                     profit = (entry_tp - entry_price) * shares
@@ -219,10 +216,11 @@ def run_backtest(df, tp_pct, trade_dir, shares):
                     trades.append({'date': row['DisplayDate'], 'type': 'Sell', 'res': res_label, 'entry': entry_price, 'exit': st_val, 'profit': profit})
                     active_trade = None; trade_closed = True
         
+        # エントリー判定
         if active_trade is None and not trade_closed and sig is not None:
             if do_long and "BUY" in sig:
                 active_trade = {'entry_price': row['Close'], 'type': 'buy', 'target_tp': row['Close']*(1+tp_pct/100)}
-            elif not do_long and "SELL" in sig:
+            elif do_short and "SELL" in sig:
                 active_trade = {'entry_price': row['Close'], 'type': 'sell', 'target_tp': row['Close']*(1-tp_pct/100)}
 
         if trade_closed:
@@ -233,51 +231,45 @@ def run_backtest(df, tp_pct, trade_dir, shares):
 
     return trades, max_dd
 
-# --- スキャン機能 (3層構造) ---
+# --- スキャン機能 (売り対応) ---
 def scan_signals(tickers):
     history_buffer = []
-    scan_bar = st.progress(0, text="スキャン中...")
+    scan_bar = st.progress(0, text="全シグナル探索中...")
     total = len(tickers)
+    notified_set = global_state["notified_ids"]
     
     for idx, t in enumerate(tickers):
         t_name = get_name(t)
         scan_bar.progress((idx + 1) / total, text=f"Analyzing: {t}...")
         
-        df_daily = get_data(t, "3mo", "1d")
-        daily_trend = "NEUTRAL"
-        if df_daily is not None and not df_daily.empty:
-            df_daily = process_data(df_daily, "1d")
-            daily_trend = "UP" if df_daily.iloc[-1]['SuperTrend_Dir'] else "DOWN"
-            
-        df_60m = get_data(t, "1mo", "60m")
-        hourly_trend = "NEUTRAL"
-        if df_60m is not None and not df_60m.empty:
-            df_60m = process_data(df_60m, "60m")
-            hourly_trend = "UP" if df_60m.iloc[-1]['SuperTrend_Dir'] else "DOWN"
+        df_daily_chk = get_data(t, "3mo", "1d"); daily_trend = "NEUTRAL"
+        if df_daily_chk is not None and not df_daily_chk.empty:
+            df_daily_chk = process_data(df_daily_chk, "1d")
+            daily_trend = "UP" if df_daily_chk.iloc[-1]['SuperTrend_Dir'] else "DOWN"
+        df_60m_chk = get_data(t, "1mo", "60m"); hourly_trend = "NEUTRAL"
+        if df_60m_chk is not None and not df_60m_chk.empty:
+            df_60m_chk = process_data(df_60m_chk, "60m")
+            hourly_trend = "UP" if df_60m_chk.iloc[-1]['SuperTrend_Dir'] else "DOWN"
 
-        # 1. 🐢 SWING
+        # 1. SWING
+        df_daily = df_daily_chk
         if df_daily is not None and not df_daily.empty:
             for i in range(len(df_daily)-1, -1, -1):
                 sig = df_daily.iloc[i]['Trade_Signal']
                 if sig:
-                    row = df_daily.iloc[i]; bars_ago = len(df_daily) - 1 - i
+                    bars_ago = len(df_daily) - 1 - i
                     is_forming = (bars_ago == 0); status = "⚡日足形成" if is_forming else "🔒日足確定"
                     ago_label = "今日" if is_forming else f"{bars_ago}日前"
-                    
-                    history_buffer.append({
-                        "dt": df_daily.index[i], "time_str": df_daily.index[i].strftime("%Y/%m/%d"),
-                        "code": t, "name": t_name, "sig": sig, "price": row['Close'], 
-                        "status": status, "type": "SWING (日足)", "ago_label": ago_label
-                    })
+                    time_str = df_daily.index[i].strftime("%Y/%m/%d")
+                    history_buffer.append({"dt": df_daily.index[i], "time_str": time_str, "code": t, "name": t_name, "sig": sig, "price": df_daily.iloc[i]['Close'], "status": status, "type": "SWING (日足)", "ago_label": ago_label})
                     
                     sig_id = f"{df_daily.index[i]}_{t}_{sig}_SWING"
-                    if bars_ago == 1 and sig_id not in st.session_state.notified_signals:
+                    if bars_ago == 1 and sig_id not in notified_set:
                         emoji = "🌊" if "BUY" in sig else "📉"
-                        send_discord_notify(f"**{emoji} [SWING] {sig} 確定**\n銘柄: {t_name}\n(日足: チャンス感知)")
-                        st.session_state.notified_signals.add(sig_id)
+                        if send_discord_notify(f"**{emoji} [SWING] {sig} 確定**\n📅 {time_str}\n銘柄: {t_name}\n価格: {df_daily.iloc[i]['Close']:,.0f}円\n(日足: チャンス感知)"): notified_set.add(sig_id)
                     if bars_ago > 7: break
 
-        # 2. 🛡️ DAY-STD (5分)
+        # 2. DAY-STD
         df_5m = get_data(t, "5d", "5m")
         if df_5m is not None and not df_5m.empty:
             df_5m = process_data(df_5m, "5m")
@@ -287,24 +279,19 @@ def scan_signals(tickers):
                     if "BUY" in sig and hourly_trend == "DOWN": continue
                     if "SELL" in sig and hourly_trend == "UP": continue
                     
-                    row = df_5m.iloc[i]; bars_ago = len(df_5m) - 1 - i
+                    bars_ago = len(df_5m) - 1 - i
                     is_forming = (bars_ago == 0); status = "⚡5分形成" if is_forming else "🔒5分確定"
-                    
-                    history_buffer.append({
-                        "dt": df_5m.index[i], "time_str": df_5m.index[i].strftime("%m/%d %H:%M"),
-                        "code": t, "name": t_name, "sig": sig, "price": row['Close'], 
-                        "status": status, "type": "DAY-STD (5分)", "ago_label": f"{bars_ago*5}分前"
-                    })
+                    time_str = df_5m.index[i].strftime("%Y/%m/%d %H:%M")
+                    history_buffer.append({"dt": df_5m.index[i], "time_str": time_str, "code": t, "name": t_name, "sig": sig, "price": df_5m.iloc[i]['Close'], "status": status, "type": "DAY-STD (5分)", "ago_label": f"{bars_ago*5}分前"})
                     
                     sig_id = f"{df_5m.index[i]}_{t}_{sig}_DAYSTD"
-                    if bars_ago == 1 and sig_id not in st.session_state.notified_signals:
+                    if bars_ago == 1 and sig_id not in notified_set:
                         emoji = "🟢" if "BUY" in sig else "🔴"
-                        send_discord_notify(f"**{emoji} [DAY-STD] {sig} 確定**\n銘柄: {t_name}\n価格: {row['Close']:,.0f}円\n(5分足: 中期トレンド一致)")
-                        st.session_state.notified_signals.add(sig_id)
+                        if send_discord_notify(f"**{emoji} [DAY-STD] {sig} 確定**\n⏰ {time_str}\n銘柄: {t_name}\n価格: {df_5m.iloc[i]['Close']:,.0f}円\n(5分足: 中期トレンド一致)"): notified_set.add(sig_id)
                     if bars_ago > 12: break
 
-        # 3. ⚡ DAY-FAST (1分)
-        df_1m = get_data(t, "5d", "1m") # 5日分取得で履歴安定化
+        # 3. DAY-FAST
+        df_1m = get_data(t, "5d", "1m")
         if df_1m is not None and not df_1m.empty:
             df_1m = process_data(df_1m, "1m")
             for i in range(len(df_1m)-1, -1, -1):
@@ -313,26 +300,19 @@ def scan_signals(tickers):
                     if "BUY" in sig and daily_trend == "DOWN": continue
                     if "SELL" in sig and daily_trend == "UP": continue
                     
-                    row = df_1m.iloc[i]; bars_ago = len(df_1m) - 1 - i
+                    bars_ago = len(df_1m) - 1 - i
                     is_forming = (bars_ago == 0); status = "⚡1分形成" if is_forming else "🔒1分確定"
-                    
-                    history_buffer.append({
-                        "dt": df_1m.index[i], "time_str": df_1m.index[i].strftime("%m/%d %H:%M"),
-                        "code": t, "name": t_name, "sig": sig, 
-                        "price": row['Close'], "status": status,
-                        "type": "DAY-FAST (1分)", "ago_label": f"{bars_ago}分前"
-                    })
+                    time_str = df_1m.index[i].strftime("%Y/%m/%d %H:%M")
+                    history_buffer.append({"dt": df_1m.index[i], "time_str": time_str, "code": t, "name": t_name, "sig": sig, "price": df_1m.iloc[i]['Close'], "status": status, "type": "DAY-FAST (1分)", "ago_label": f"{bars_ago}分前"})
                     
                     sig_id = f"{df_1m.index[i]}_{t}_{sig}_DAYFAST"
-                    if bars_ago == 1 and sig_id not in st.session_state.notified_signals:
+                    if bars_ago == 1 and sig_id not in notified_set:
                         emoji = "🔥" if "BUY" in sig else "❄️"
-                        send_discord_notify(f"**{emoji} [DAY-FAST] {sig} 確定**\n銘柄: {t_name}\n価格: {row['Close']:,.0f}円\n(1分足: 厳格条件突破)")
-                        st.session_state.notified_signals.add(sig_id)
+                        if send_discord_notify(f"**{emoji} [DAY-FAST] {sig} 確定**\n⏰ {time_str}\n銘柄: {t_name}\n価格: {df_1m.iloc[i]['Close']:,.0f}円\n(1分足: 厳格条件突破)"): notified_set.add(sig_id)
                     if bars_ago > 10: break
 
     scan_bar.empty()
     history_buffer.sort(key=lambda x: x['dt'], reverse=True)
-    st.session_state.alert_history = history_buffer
     return history_buffer
 
 def display_signal_cards(signal_list, use_cols=4):
@@ -340,31 +320,29 @@ def display_signal_cards(signal_list, use_cols=4):
     cols = st.columns(use_cols)
     for i, item in enumerate(signal_list):
         with cols[i % use_cols]:
-            color = "#d32f2f" if "BUY" in item['sig'] else "#00796b"
-            icon = "🔥" if "BUY" in item['sig'] else "🧊"
+            is_buy = "BUY" in item['sig']
+            color = "#d32f2f" if is_buy else "#00796b"
+            icon = "🔥" if is_buy else "🧊"
             status_text = item.get('status', '履歴'); border = "dashed" if "形成" in status_text else "solid"
-            
             src_type = item.get('type', 'Unknown')
             if "SWING" in src_type: badge_style = "background-color:#3F51B5; color:white"
             elif "STD" in src_type: badge_style = "background-color:#4CAF50; color:white"
             else: badge_style = "background-color:#FF9800; color:white"
-
             st.markdown(f"""
             <div style="border:2px {border} {color}; padding:10px; border-radius:8px; margin-bottom:10px; background-color:#262730;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
                     <span style="font-weight:bold; color:#fff; font-size:1.1em;">{item['name']}</span>
                     <span style="{badge_style}; padding:2px 6px; border-radius:4px; font-size:0.75em;">{src_type}</span>
                 </div>
-                <div style="font-size:0.85em; color:#ddd;">{status_text} | {item.get('ago_label')}</div>
+                <div style="font-size:0.85em; color:#ddd;">{status_text} | {item.get('time_str')}</div>
                 <div style="color:{color}; font-weight:900; font-size:1.1em; margin: 5px 0;">{icon} {item['sig']}</div>
                 <div style="color:#fff; font-size:1.1em;">{item['price']:,.0f} 円</div>
-            </div>
-            """, unsafe_allow_html=True)
+            </div>""", unsafe_allow_html=True)
 
 # --- レイアウト ---
-st.sidebar.title("💎 Watcher 22.0")
+st.sidebar.title("💎 Watcher 23.1")
 if st.sidebar.button("🔔 通知テスト"):
-    if send_discord_notify("🔔 [TEST] Cloud Connection OK."): st.sidebar.success("OK")
+    if send_discord_notify("🔔 [TEST] System Normal."): st.sidebar.success("OK")
     else: st.sidebar.error("NG (Check Secrets)")
 
 if st.session_state.current_ticker in st.session_state.favorites: fav_idx = st.session_state.favorites.index(st.session_state.current_ticker)
@@ -402,24 +380,21 @@ if auto_refresh: st_autorefresh(interval=60*1000, key="refresh")
 st.sidebar.subheader("💰 バックテスト設定")
 tp_pct = st.sidebar.number_input("利確 (%)", 0.1, 100.0, 1.0, 0.1) 
 trade_shares = st.sidebar.number_input("株数", 100, 10000, 100, 100)
-trade_dir = st.sidebar.radio("売買方向", ["買い", "売り"], horizontal=True)
+trade_dir = st.sidebar.radio("売買方向", ["買い", "売り", "両方"], horizontal=True)
 
-# --- メイン画面 ---
 tab_mon, tab_anl = st.tabs(["🚨 監視パネル", "📈 統合分析"])
 
 with tab_mon:
     if st.button("スキャン更新", type="primary"): st.rerun()
     all_history = scan_signals(st.session_state.favorites)
     now = pd.Timestamp.now(tz='Asia/Tokyo'); one_day_ago = now - pd.Timedelta(days=1)
-    
     recent_list = [h for h in all_history if h['dt'] >= one_day_ago]
     past_list = [h for h in all_history if h['dt'] < one_day_ago]
-            
-    st.markdown("### 🔔 直近24時間 (全銘柄)")
+    st.markdown("### 🔔 直近24時間 (全シグナル)")
     if recent_list: display_signal_cards(recent_list)
     else: st.info("直近24時間にシグナルはありません。")
     st.markdown("---")
-    st.markdown("### 📜 過去1週間の履歴 (全銘柄)")
+    st.markdown("### 📜 過去1週間の履歴")
     if past_list:
         df_view = pd.DataFrame(past_list)
         st.dataframe(df_view[['time_str', 'type', 'name', 'code', 'sig', 'price', 'status']], use_container_width=True)
@@ -429,34 +404,6 @@ with tab_anl:
     t = st.session_state.current_ticker; t_name = get_name(t)
     st.header(f"{t} {t_name}")
     
-    df_5m = get_data(t, "5d", "5m"); df_60m = get_data(t, "1mo", "60m"); df_d = get_data(t, "3mo", "1d")
-    trend_res = {"5m": "NONE", "60m": "NONE", "1d": "NONE"}
-    if df_5m is not None: df_5m = process_data(df_5m, "5m"); trend_res["5m"] = "UP" if df_5m.iloc[-1]['SuperTrend_Dir'] else "DOWN"
-    if df_60m is not None: df_60m = process_data(df_60m, "60m"); trend_res["60m"] = "UP" if df_60m.iloc[-1]['SuperTrend_Dir'] else "DOWN"
-    if df_d is not None: df_d = process_data(df_d, "1d"); trend_res["1d"] = "UP" if df_d.iloc[-1]['SuperTrend_Dir'] else "DOWN"
-
-    s = trend_res["5m"]; m = trend_res["60m"]; l = trend_res["1d"]
-    nav_title = ""; nav_desc = ""; nav_color = ""
-    if s=="UP" and m=="UP" and l=="UP": nav_title = "🟢 SWING POSSIBLE"; nav_color = "success"; nav_desc = "全期間上昇。持ち越し可。"
-    elif s=="UP" and l=="DOWN": nav_title = "🔴 DAY TRADE ONLY"; nav_color = "error"; nav_desc = "長期下落中。本日中に手仕舞い推奨。"
-    elif s=="DOWN" and l=="UP": nav_title = "⚠️ WAITING"; nav_color = "warning"; nav_desc = "押し目待ち。"
-    elif s=="DOWN" and m=="DOWN" and l=="DOWN": nav_title = "🟢 SELLING SWING"; nav_color = "success"; nav_desc = "全期間下落。売り持ち越し可。"
-    else: nav_title = "👀 OBSERVATION"; nav_color = "info"; nav_desc = "方向感なし。"
-
-    st.subheader("🧭 推奨戦略ナビゲーター")
-    with st.container():
-        if nav_color == "success": st.success(f"### {nav_title}\n{nav_desc}")
-        elif nav_color == "error": st.error(f"### {nav_title}\n{nav_desc}")
-        elif nav_color == "warning": st.warning(f"### {nav_title}\n{nav_desc}")
-        else: st.info(f"### {nav_title}\n{nav_desc}")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("短期(5m)", s, delta_color="normal" if s=="UP" else "inverse")
-        c2.metric("中期(60m)", m, delta_color="normal" if m=="UP" else "inverse")
-        c3.metric("長期(Day)", l, delta_color="normal" if l=="UP" else "inverse")
-    
-    st.markdown("---")
-
-    # チャート & バックテスト
     if period == "1d" and interval == "1m": df_chart = get_data(t, "5d", "1m")
     elif period == "1d" and interval == "5m": df_chart = get_data(t, "5d", "5m")
     else: df_chart = get_data(t, period, interval)
@@ -480,10 +427,12 @@ with tab_anl:
         st_r = df_chart['SuperTrend'].copy(); st_r[df_chart['SuperTrend_Dir'] == True] = None
         fig.add_trace(go.Scatter(x=x, y=st_g, mode='lines', line=dict(color='blue'), name='Support'), row=1, col=1)
         fig.add_trace(go.Scatter(x=x, y=st_r, mode='lines', line=dict(color='orange'), name='Resist'), row=1, col=1)
+        
         buy = df_chart[df_chart['Trade_Signal'].str.contains('BUY', na=False)]
         sell = df_chart[df_chart['Trade_Signal'].str.contains('SELL', na=False)]
         if not buy.empty: fig.add_trace(go.Scatter(x=buy['DisplayDate'], y=buy['Low'], mode='markers', marker=dict(symbol='triangle-up', size=15, color='red'), name='BUY'), row=1, col=1)
         if not sell.empty: fig.add_trace(go.Scatter(x=sell['DisplayDate'], y=sell['High'], mode='markers', marker=dict(symbol='triangle-down', size=15, color='green'), name='SELL'), row=1, col=1)
+
         fig.add_trace(go.Bar(x=x, y=df_chart['MACD']-df_chart['Signal'], name='Hist'), row=2, col=1)
         fig.add_trace(go.Scatter(x=x, y=df_chart['MACD'], name='MACD'), row=2, col=1)
         fig.add_trace(go.Scatter(x=x, y=df_chart['ADX'], name='ADX', line=dict(color='white')), row=3, col=1)
@@ -495,9 +444,14 @@ with tab_anl:
         min_dt = df_chart.index.min().to_pydatetime(); max_dt = df_chart.index.max().to_pydatetime()
         bt_range = st.slider("検証期間", min_value=min_dt, max_value=max_dt, value=(min_dt, max_dt), format="MM/DD")
         if st.button("バックテスト実行", type="primary"):
-            df_bt = df_chart[(df_chart.index >= bt_range[0]) & (df_chart.index <= bt_range[1])]
-            trades, max_dd = run_backtest(df_bt, tp_pct, trade_dir, trade_shares)
-            st.session_state.bt_results = {"trades": trades, "max_dd": max_dd}
+            if period == "1d" and interval == "1m": df_calc = get_data(t, "5d", "1m")
+            elif period == "1d" and interval == "5m": df_calc = get_data(t, "5d", "5m")
+            else: df_calc = get_data(t, period, interval)
+            if df_calc is not None:
+                df_calc = process_data(df_calc, interval)
+                df_bt = df_calc[(df_calc.index >= bt_range[0]) & (df_calc.index <= bt_range[1])]
+                trades, max_dd = run_backtest(df_bt, tp_pct, trade_dir if "両方" not in trade_dir else ["買い","売り"], trade_shares)
+                st.session_state.bt_results = {"trades": trades, "max_dd": max_dd}
         if st.session_state.bt_results is not None:
             trades = st.session_state.bt_results["trades"]; max_dd = st.session_state.bt_results["max_dd"]
             if len(trades) > 0:
@@ -507,28 +461,3 @@ with tab_anl:
                 c4.metric("最大DD", f"-{max_dd:,.0f}", delta=-max_dd, delta_color="inverse")
                 st.dataframe(pd.DataFrame(trades)[['date','type','res','entry','exit','profit']].round(0), use_container_width=True)
             else: st.warning("期間内にシグナルはありませんでした。")
-    
-    st.markdown("---")
-    st.subheader("📜 シグナル履歴 (過去1週間)")
-    df_hist = get_data(t, "5d", "1m")
-    if df_hist is not None and not df_hist.empty:
-        df_hist = process_data(df_hist, "1m")
-        past_signals = []
-        for i in range(len(df_hist)-1, -1, -1):
-            row = df_hist.iloc[i]
-            if row['Trade_Signal']:
-                past_signals.append({
-                    "name": t_name, "code": t, "time_str": row['DisplayDate'], "ago": row['DisplayDate'],
-                    "sig": row['Trade_Signal'], "price": row['Close'], "status": "🔒確定", "dt": df_hist.index[i], "type": "DAY"
-                })
-        now = pd.Timestamp.now(tz='Asia/Tokyo'); one_day_ago = now - pd.Timedelta(days=1)
-        recent_list = [h for h in past_signals if h['dt'] >= one_day_ago]
-        past_list = [h for h in past_signals if h['dt'] < one_day_ago]
-        st.markdown("##### 🔔 直近24時間以内")
-        if recent_list: display_signal_cards(recent_list)
-        else: st.info("直近24時間のシグナルはありません")
-        st.markdown("##### ⏮ それ以前 (1週間以内)")
-        if past_list:
-            view_data = [{"日時": i['time_str'], "シグナル": i['sig'], "価格": f"{i['price']:,.0f}", "状態": i['status']} for i in past_list]
-            st.dataframe(pd.DataFrame(view_data), use_container_width=True)
-        else: st.info("過去1週間のシグナルはありません")
