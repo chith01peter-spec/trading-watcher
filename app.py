@@ -33,7 +33,7 @@ def run_streamlit():
 run_streamlit()
 
 # ==========================================
-# V24.0 Trading Watcher (Speed Tuned: 20s Refresh)
+# V24.1 Trading Watcher (Data Structure Fix)
 # ==========================================
 import streamlit as st
 import pandas as pd
@@ -44,7 +44,7 @@ from streamlit_autorefresh import st_autorefresh
 import numpy as np
 import requests
 
-st.set_page_config(page_title="Trading Watcher V24.0", layout="wide")
+st.set_page_config(page_title="Trading Watcher V24.1", layout="wide")
 
 # ==========================================
 # ★設定エリア
@@ -81,22 +81,35 @@ def send_discord_notify(msg):
     try: requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}); return True
     except: return False
 
-# ★ 高速化ポイント1: キャッシュ寿命を15秒→10秒に短縮
+# ★ 修正ポイント1: データ取得時の構造平坦化
 @st.cache_data(ttl=10)
 def get_data(ticker, period, interval):
     try:
         ticker_mod = f"{ticker}.T" if ".T" not in ticker and ticker.isdigit() else ticker
-        df = yf.download(ticker_mod, period=period, interval=interval, progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            if df.columns.nlevels > 1: df.columns = df.columns.droplevel(1)
+        # auto_adjust=False で生データを取得し、構造を制御
+        df = yf.download(ticker_mod, period=period, interval=interval, progress=False, auto_adjust=False)
+        
         if df.empty: return None
+
+        # MultiIndexカラム（2段重ね）の強制解除
+        if isinstance(df.columns, pd.MultiIndex):
+            # レベル0（Close, Openなど）だけを残す
+            df.columns = df.columns.get_level_values(0)
+        
+        # 重複カラムの削除（念のため）
+        df = df.loc[:, ~df.columns.duplicated()]
+        
+        # タイムゾーン処理
         if df.index.tz is None:
             try: df.index = df.index.tz_localize('Asia/Tokyo')
             except: pass
         else:
             df.index = df.index.tz_convert('Asia/Tokyo')
+            
         return df
-    except: return None
+    except Exception as e:
+        print(f"Error downloading {ticker}: {e}")
+        return None
 
 # --- テクニカル計算 ---
 def process_data(df, interval):
@@ -104,13 +117,23 @@ def process_data(df, interval):
     if "m" in interval or "h" in interval: df['DisplayDate'] = df.index.strftime('%m/%d %H:%M')
     else: df['DisplayDate'] = df.index.strftime('%Y/%m/%d')
 
-    v = df['Volume']; tp = (df['High'] + df['Low'] + df['Close']) / 3
-    df['VWAP'] = (tp * v).cumsum() / v.cumsum()
+    # ★ 修正ポイント2: 計算時のSeries強制
+    try:
+        v = df['Volume'].squeeze() # 1次元配列に強制変換
+        tp = ((df['High'] + df['Low'] + df['Close']) / 3).squeeze()
+        
+        # VWAP計算
+        df['VWAP'] = (tp * v).cumsum() / v.cumsum()
+    except Exception as e:
+        # 計算不能時はNoneを入れる（エラー落ち回避）
+        df['VWAP'] = np.nan
 
     high = df['High']; low = df['Low']; close = df['Close']
     tr1 = high - low; tr2 = (high - close.shift()).abs(); tr3 = (low - close.shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.rolling(14).mean()
+    
+    # ADX
     up = high.diff(); down = low.diff()
     plus_dm = np.where((up > down) & (up > 0), up, 0); minus_dm = np.where((down > up) & (down > 0), down, 0)
     plus_dm = pd.Series(plus_dm, index=df.index); minus_dm = pd.Series(minus_dm, index=df.index)
@@ -222,11 +245,9 @@ def run_backtest(df, tp_pct, trade_dir, shares):
             if dd > max_dd: max_dd = dd
     return trades, max_dd
 
-# --- スキャン機能 ---
+# --- スキャン機能 (変数汚染対策済み) ---
 def scan_signals(tickers):
     history_buffer = []
-    # ★ 高速化ポイント2: プログレスバーの更新頻度を落とすか削除して速度優先
-    # ここではシンプルに残すが、処理自体はキャッシュのおかげで速い
     scan_bar = st.progress(0, text="高速スキャン中...")
     total = len(tickers)
     notified_set = global_state["notified_ids"]
@@ -235,17 +256,28 @@ def scan_signals(tickers):
     today_str = now_jst.strftime("%Y-%m-%d")
     
     for idx, t in enumerate(tickers):
+        # ★ ループのたびに変数を初期化（これが銘柄混同の防止策）
+        df_daily_chk = None
+        df_60m_chk = None
+        daily_trend = "NEUTRAL"
+        hourly_trend = "NEUTRAL"
+        
         t_name = get_name(t)
         scan_bar.progress((idx + 1) / total, text=f"Checking: {t}...")
         
-        df_daily_chk = get_data(t, "3mo", "1d"); daily_trend = "NEUTRAL"
-        if df_daily_chk is not None and not df_daily_chk.empty:
-            df_daily_chk = process_data(df_daily_chk, "1d")
-            daily_trend = "UP" if df_daily_chk.iloc[-1]['SuperTrend_Dir'] else "DOWN"
-        df_60m_chk = get_data(t, "1mo", "60m"); hourly_trend = "NEUTRAL"
-        if df_60m_chk is not None and not df_60m_chk.empty:
-            df_60m_chk = process_data(df_60m_chk, "60m")
-            hourly_trend = "UP" if df_60m_chk.iloc[-1]['SuperTrend_Dir'] else "DOWN"
+        # データ取得
+        try:
+            df_daily_chk = get_data(t, "3mo", "1d")
+            if df_daily_chk is not None and not df_daily_chk.empty:
+                df_daily_chk = process_data(df_daily_chk, "1d")
+                daily_trend = "UP" if df_daily_chk.iloc[-1]['SuperTrend_Dir'] else "DOWN"
+            
+            df_60m_chk = get_data(t, "1mo", "60m")
+            if df_60m_chk is not None and not df_60m_chk.empty:
+                df_60m_chk = process_data(df_60m_chk, "60m")
+                hourly_trend = "UP" if df_60m_chk.iloc[-1]['SuperTrend_Dir'] else "DOWN"
+        except:
+            continue # データ取得失敗時はスキップ
 
         # 1. SWING
         df_daily = df_daily_chk
@@ -280,6 +312,7 @@ def scan_signals(tickers):
                 if sig:
                     if "BUY" in sig and hourly_trend == "DOWN": continue
                     if "SELL" in sig and hourly_trend == "UP": continue
+                    
                     bars_ago = len(df_5m) - 1 - i
                     is_forming = (bars_ago == 0); status = "⚡5分形成" if is_forming else "🔒5分確定"
                     time_str = df_5m.index[i].strftime("%Y-%m-%d %H:%M")
@@ -306,6 +339,7 @@ def scan_signals(tickers):
                 if sig:
                     if "BUY" in sig and daily_trend == "DOWN": continue
                     if "SELL" in sig and daily_trend == "UP": continue
+                    
                     bars_ago = len(df_1m) - 1 - i
                     is_forming = (bars_ago == 0); status = "⚡1分形成" if is_forming else "🔒1分確定"
                     time_str = df_1m.index[i].strftime("%Y-%m-%d %H:%M")
@@ -355,7 +389,7 @@ def display_signal_cards(signal_list, use_cols=4):
             </div>""", unsafe_allow_html=True)
 
 # --- レイアウト ---
-st.sidebar.title("💎 Watcher 24.0")
+st.sidebar.title("💎 Watcher 24.1")
 if st.sidebar.button("🔔 通知テスト"):
     if send_discord_notify("🔔 [TEST] System Normal."): st.sidebar.success("OK")
     else: st.sidebar.error("NG (Check Secrets)")
@@ -389,7 +423,6 @@ with st.sidebar.expander("🛡 ロット計算機", expanded=True):
 c1, c2 = st.sidebar.columns(2)
 period = c1.selectbox("期間", ["1d", "5d", "1mo", "3mo"], index=1)
 interval = c2.selectbox("時間足", ["1m", "5m", "15m", "1h", "1d"], index=0)
-# ★ 高速化ポイント3: 20秒リフレッシュ
 auto_refresh = st.sidebar.checkbox("自動更新 (20s)", True)
 if auto_refresh: st_autorefresh(interval=20*1000, key="refresh")
 
