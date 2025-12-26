@@ -33,7 +33,7 @@ def run_streamlit():
 run_streamlit()
 
 # ==========================================
-# V23.4 Trading Watcher (Stale Filter Added)
+# V24.0 Trading Watcher (Speed Tuned: 20s Refresh)
 # ==========================================
 import streamlit as st
 import pandas as pd
@@ -44,7 +44,7 @@ from streamlit_autorefresh import st_autorefresh
 import numpy as np
 import requests
 
-st.set_page_config(page_title="Trading Watcher V23.4", layout="wide")
+st.set_page_config(page_title="Trading Watcher V24.0", layout="wide")
 
 # ==========================================
 # ★設定エリア
@@ -81,7 +81,8 @@ def send_discord_notify(msg):
     try: requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}); return True
     except: return False
 
-@st.cache_data(ttl=15)
+# ★ 高速化ポイント1: キャッシュ寿命を15秒→10秒に短縮
+@st.cache_data(ttl=10)
 def get_data(ticker, period, interval):
     try:
         ticker_mod = f"{ticker}.T" if ".T" not in ticker and ticker.isdigit() else ticker
@@ -221,20 +222,21 @@ def run_backtest(df, tp_pct, trade_dir, shares):
             if dd > max_dd: max_dd = dd
     return trades, max_dd
 
-# --- スキャン機能 (鮮度フィルター搭載) ---
+# --- スキャン機能 ---
 def scan_signals(tickers):
     history_buffer = []
-    scan_bar = st.progress(0, text="全シグナル探索中...")
+    # ★ 高速化ポイント2: プログレスバーの更新頻度を落とすか削除して速度優先
+    # ここではシンプルに残すが、処理自体はキャッシュのおかげで速い
+    scan_bar = st.progress(0, text="高速スキャン中...")
     total = len(tickers)
     notified_set = global_state["notified_ids"]
     
-    # ★現在時刻 (JST)
     now_jst = pd.Timestamp.now(tz='Asia/Tokyo')
     today_str = now_jst.strftime("%Y-%m-%d")
     
     for idx, t in enumerate(tickers):
         t_name = get_name(t)
-        scan_bar.progress((idx + 1) / total, text=f"Analyzing: {t}...")
+        scan_bar.progress((idx + 1) / total, text=f"Checking: {t}...")
         
         df_daily_chk = get_data(t, "3mo", "1d"); daily_trend = "NEUTRAL"
         if df_daily_chk is not None and not df_daily_chk.empty:
@@ -245,7 +247,7 @@ def scan_signals(tickers):
             df_60m_chk = process_data(df_60m_chk, "60m")
             hourly_trend = "UP" if df_60m_chk.iloc[-1]['SuperTrend_Dir'] else "DOWN"
 
-        # 1. SWING (日足)
+        # 1. SWING
         df_daily = df_daily_chk
         if df_daily is not None and not df_daily.empty:
             for i in range(len(df_daily)-1, -1, -1):
@@ -255,12 +257,9 @@ def scan_signals(tickers):
                     is_forming = (date_val == today_str)
                     status = "⚡日足形成" if is_forming else "🔒日足確定"
                     ago_label = "今日" if is_forming else f"{date_val}"
-                    
                     history_buffer.append({"dt": df_daily.index[i], "time_str": date_val, "code": t, "name": t_name, "sig": sig, "price": df_daily.iloc[i]['Close'], "status": status, "type": "SWING (日足)", "ago_label": ago_label})
                     
                     sig_id = f"{date_val}_{t}_{sig}_SWING"
-                    
-                    # ★ 鮮度チェック: 2日以上前のシグナルは通知しない
                     time_diff = now_jst - df_daily.index[i]
                     is_fresh = time_diff < timedelta(days=2)
 
@@ -269,11 +268,10 @@ def scan_signals(tickers):
                         if send_discord_notify(f"**{emoji} [SWING] {sig} 確定**\n📅 {date_val}\n銘柄: {t_name}\n価格: {df_daily.iloc[i]['Close']:,.0f}円\n(日足: チャンス感知)"):
                             notified_set.add(sig_id)
                     elif not is_fresh and sig_id not in notified_set:
-                        notified_set.add(sig_id) # 通知せずに既読にする
-                        
+                        notified_set.add(sig_id)
                     if i < len(df_daily) - 7: break
 
-        # 2. DAY-STD (5分)
+        # 2. DAY-STD
         df_5m = get_data(t, "5d", "5m")
         if df_5m is not None and not df_5m.empty:
             df_5m = process_data(df_5m, "5m")
@@ -282,15 +280,12 @@ def scan_signals(tickers):
                 if sig:
                     if "BUY" in sig and hourly_trend == "DOWN": continue
                     if "SELL" in sig and hourly_trend == "UP": continue
-                    
                     bars_ago = len(df_5m) - 1 - i
                     is_forming = (bars_ago == 0); status = "⚡5分形成" if is_forming else "🔒5分確定"
                     time_str = df_5m.index[i].strftime("%Y-%m-%d %H:%M")
                     history_buffer.append({"dt": df_5m.index[i], "time_str": time_str, "code": t, "name": t_name, "sig": sig, "price": df_5m.iloc[i]['Close'], "status": status, "type": "DAY-STD (5分)", "ago_label": f"{bars_ago*5}分前"})
                     
                     sig_id = f"{time_str}_{t}_{sig}_DAYSTD"
-                    
-                    # ★ 鮮度チェック: 3時間以上前は通知しない
                     time_diff = now_jst - df_5m.index[i]
                     is_fresh = time_diff < timedelta(hours=3)
                     
@@ -300,10 +295,9 @@ def scan_signals(tickers):
                             notified_set.add(sig_id)
                     elif not is_fresh and sig_id not in notified_set:
                         notified_set.add(sig_id)
-
                     if bars_ago > 12: break
 
-        # 3. DAY-FAST (1分)
+        # 3. DAY-FAST
         df_1m = get_data(t, "5d", "1m")
         if df_1m is not None and not df_1m.empty:
             df_1m = process_data(df_1m, "1m")
@@ -312,15 +306,12 @@ def scan_signals(tickers):
                 if sig:
                     if "BUY" in sig and daily_trend == "DOWN": continue
                     if "SELL" in sig and daily_trend == "UP": continue
-                    
                     bars_ago = len(df_1m) - 1 - i
                     is_forming = (bars_ago == 0); status = "⚡1分形成" if is_forming else "🔒1分確定"
                     time_str = df_1m.index[i].strftime("%Y-%m-%d %H:%M")
                     history_buffer.append({"dt": df_1m.index[i], "time_str": time_str, "code": t, "name": t_name, "sig": sig, "price": df_1m.iloc[i]['Close'], "status": status, "type": "DAY-FAST (1分)", "ago_label": f"{bars_ago}分前"})
                     
                     sig_id = f"{time_str}_{t}_{sig}_DAYFAST"
-                    
-                    # ★ 鮮度チェック: 3時間以上前は通知しない
                     time_diff = now_jst - df_1m.index[i]
                     is_fresh = time_diff < timedelta(hours=3)
                     
@@ -330,7 +321,6 @@ def scan_signals(tickers):
                             notified_set.add(sig_id)
                     elif not is_fresh and sig_id not in notified_set:
                         notified_set.add(sig_id)
-                        
                     if bars_ago > 10: break
 
     scan_bar.empty()
@@ -365,7 +355,7 @@ def display_signal_cards(signal_list, use_cols=4):
             </div>""", unsafe_allow_html=True)
 
 # --- レイアウト ---
-st.sidebar.title("💎 Watcher 23.4")
+st.sidebar.title("💎 Watcher 24.0")
 if st.sidebar.button("🔔 通知テスト"):
     if send_discord_notify("🔔 [TEST] System Normal."): st.sidebar.success("OK")
     else: st.sidebar.error("NG (Check Secrets)")
@@ -399,8 +389,9 @@ with st.sidebar.expander("🛡 ロット計算機", expanded=True):
 c1, c2 = st.sidebar.columns(2)
 period = c1.selectbox("期間", ["1d", "5d", "1mo", "3mo"], index=1)
 interval = c2.selectbox("時間足", ["1m", "5m", "15m", "1h", "1d"], index=0)
-auto_refresh = st.sidebar.checkbox("自動更新 (60s)", True)
-if auto_refresh: st_autorefresh(interval=60*1000, key="refresh")
+# ★ 高速化ポイント3: 20秒リフレッシュ
+auto_refresh = st.sidebar.checkbox("自動更新 (20s)", True)
+if auto_refresh: st_autorefresh(interval=20*1000, key="refresh")
 
 st.sidebar.subheader("💰 バックテスト設定")
 tp_pct = st.sidebar.number_input("利確 (%)", 0.1, 100.0, 1.0, 0.1) 
